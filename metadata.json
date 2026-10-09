@@ -1,0 +1,6 @@
+{
+  "name": "Aria Vision",
+  "description": "AI-powered real-time navigation assistant for blind and visually impaired users with Meta Project Aria smart glasses integration, obstacle detection, and spoken guidance.",
+  "requestFramePermissions": ["camera", "microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
