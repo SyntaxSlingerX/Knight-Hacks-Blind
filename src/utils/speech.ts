@@ -67,6 +67,19 @@ class SpeechManager {
   }
 
   /**
+   * Unlocks Web Speech Synthesis on iOS Safari during a direct user tap gesture
+   * so async responses after network calls are allowed to speak aloud.
+   */
+  public unlockForIOS(): void {
+    if (!this.synth) return;
+    try {
+      const unlockUtterance = new SpeechSynthesisUtterance('');
+      unlockUtterance.volume = 0;
+      this.synth.speak(unlockUtterance);
+    } catch (_) {}
+  }
+
+  /**
    * Speak text with priority support.
    * isUrgent / interrupt: cancel anything speaking and cut in immediately.
    * Otherwise: queue behind the current utterance (keeping only the newest couple of items).

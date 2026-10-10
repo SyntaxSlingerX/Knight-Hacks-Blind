@@ -3,12 +3,53 @@ import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { createServer as createViteServer } from 'vite';
-import { GoogleGenAI, Type, ThinkingLevel } from '@google/genai';
+import { GoogleGenAI, Type } from '@google/genai';
 
-dotenv.config();
+dotenv.config({ override: true });
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+const FALLBACK_MODELS = [
+  'gemini-3.6-flash',
+  'gemini-3.5-flash',
+  'gemini-3.5-flash-lite',
+  'gemini-3.8-flash',
+];
+
+function getAiClient(): GoogleGenAI {
+  dotenv.config({ override: true });
+  const rawKey = (process.env.GEMINI_API_KEY || '').trim();
+  const sanitizedKey = rawKey.replace(/^AIzaS(?=AQ\.)/, '');
+  return new GoogleGenAI({
+    apiKey: sanitizedKey,
+    httpOptions: {
+      headers: {
+        'User-Agent': 'aistudio-build',
+      },
+    },
+  });
+}
+
+async function generateWithFallback(params: { contents: any; config: any }) {
+  const ai = getAiClient();
+  let lastError: any = null;
+
+  for (const model of FALLBACK_MODELS) {
+    try {
+      return await ai.models.generateContent({
+        model,
+        contents: params.contents,
+        config: params.config,
+      });
+    } catch (err: any) {
+      lastError = err;
+      console.warn(`Model ${model} failed (${err?.status || err?.message}), trying next fallback...`);
+    }
+  }
+
+  throw lastError;
+}
 
 async function startServer() {
   const app = express();
@@ -17,18 +58,9 @@ async function startServer() {
   // JSON body parser with limit for base64 camera frames
   app.use(express.json({ limit: '25mb' }));
 
-  // Initialize Gemini client with mandatory User-Agent
-  const ai = new GoogleGenAI({
-    apiKey: process.env.GEMINI_API_KEY,
-    httpOptions: {
-      headers: {
-        'User-Agent': 'aistudio-build',
-      },
-    },
-  });
-
   // Health check endpoint
   app.get('/api/health', (req, res) => {
+    dotenv.config({ override: true });
     res.json({
       status: 'ok',
       service: 'Aria Vision Server',
@@ -98,17 +130,13 @@ CRITICAL SAFETY & ASSISTIVE RULES:
 
       const promptText = `Analyze this camera view from the smart glasses. Identify all navigation hazards, walking path status, doorways, stairs, obstacles, and people. Provide immediate navigation guidance.`;
 
-      const response = await ai.models.generateContent({
-        model: 'gemini-3.8-flash',
+      const response = await generateWithFallback({
         contents: {
           parts: [imagePart, { text: promptText }],
         },
         config: {
           systemInstruction,
           responseMimeType: 'application/json',
-          thinkingConfig: {
-            thinkingLevel: ThinkingLevel.LOW, // Low thinking for fast navigation latency
-          },
           responseSchema: {
             type: Type.OBJECT,
             properties: {
@@ -193,10 +221,10 @@ CRITICAL SAFETY & ASSISTIVE RULES:
    */
   app.post('/api/aria/query', async (req, res) => {
     try {
-      const { image, question } = req.body;
+      const { image, question, audio, audioMimeType } = req.body;
 
-      if (!question) {
-        return res.status(400).json({ error: 'Question is required' });
+      if (!question && !audio) {
+        return res.status(400).json({ error: 'Question or audio is required' });
       }
 
       const promptParts: any[] = [];
@@ -211,8 +239,23 @@ CRITICAL SAFETY & ASSISTIVE RULES:
         });
       }
 
+      if (audio) {
+        const cleanAudio = audio.replace(/^data:audio\/[^;]+;base64,/, '');
+        promptParts.push({
+          inlineData: {
+            mimeType: audioMimeType || 'audio/mp4',
+            data: cleanAudio,
+          },
+        });
+      }
+
       promptParts.push({
-        text: `The visually impaired user is asking: "${question}".
+        text: audio
+          ? `Listen to the visually impaired user's spoken question in the attached audio (or if silent/unclear, assume they asked: "${question || 'What is in front of me and is the path safe?'}").
+Answer directly, concisely, and spatially based on the camera view.
+Be specific with locations (e.g. "on your right around 5 feet away", "directly in front of you").
+Keep answer under 30 words so it can be spoken quickly.`
+          : `The visually impaired user is asking: "${question}".
 Answer directly, concisely, and spatially based on the camera view.
 Be specific with locations (e.g. "on your right around 5 feet away", "directly in front of you").
 If the object is not visible, say so clearly and suggest where to turn.
@@ -222,17 +265,13 @@ Do not guess. Prioritize safety. Keep answer under 30 words so it can be spoken 
       const systemInstruction = `You are ARIA VISION, answering questions for a blind user wearing smart glasses.
 Always speak clearly, spatially, and concisely. Keep answers suitable for text-to-speech voice output.`;
 
-      const response = await ai.models.generateContent({
-        model: 'gemini-3.8-flash',
+      const response = await generateWithFallback({
         contents: {
           parts: promptParts,
         },
         config: {
           systemInstruction,
           responseMimeType: 'application/json',
-          thinkingConfig: {
-            thinkingLevel: ThinkingLevel.LOW,
-          },
           responseSchema: {
             type: Type.OBJECT,
             properties: {

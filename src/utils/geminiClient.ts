@@ -27,7 +27,9 @@ export async function analyzeNavigationFrame(
 
 export async function askNavigationQuestion(
   base64Image: string | null,
-  question: string
+  question: string,
+  audioBase64?: string | null,
+  audioMimeType?: string
 ): Promise<VoiceQueryResponse> {
   const response = await fetch('/api/aria/query', {
     method: 'POST',
@@ -35,6 +37,8 @@ export async function askNavigationQuestion(
     body: JSON.stringify({
       image: base64Image,
       question,
+      audio: audioBase64 || undefined,
+      audioMimeType: audioMimeType || undefined,
     }),
   });
 
