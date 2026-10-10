@@ -109,6 +109,7 @@ export default function App() {
   const lastUrgencyRef = useRef<string>('');
   const lastDirectionRef = useRef<string>('');
   const scanInFlightRef = useRef<boolean>(false);
+  const manualScanPendingRef = useRef<boolean>(false);
   const voiceBusyRef = useRef<boolean>(false);
   // Where the user asked to go ("the exit door"); empty when they haven't asked
   const [currentGoal, setCurrentGoal] = useState<string>('');
@@ -138,16 +139,28 @@ export default function App() {
   }, []);
 
   // Perform single vision frame scan
-  const performScan = useCallback(async (isManual: boolean = false) => {
-    if (!captureFrameRef.current || scanInFlightRef.current) return;
+  const performScan = useCallback(async (requestedManually: boolean = false) => {
+    if (!captureFrameRef.current) return;
+    if (requestedManually) {
+      // Only manual scans show "Analyzing..."; background scans run quietly
+      setIsScanning(true);
+      if (!isMutedRef.current) {
+        speechManager.speak('Scanning scene.', { interrupt: true });
+      }
+    }
+    if (scanInFlightRef.current) {
+      // A background scan is already running: announce its result as the manual scan
+      if (requestedManually) manualScanPendingRef.current = true;
+      return;
+    }
     const frame = captureFrameRef.current();
-    if (!frame) return;
+    if (!frame) {
+      setIsScanning(false);
+      return;
+    }
 
     scanInFlightRef.current = true;
-    setIsScanning(true);
-    if (isManual && !isMutedRef.current) {
-      speechManager.speak('Scanning scene.', { interrupt: true });
-    }
+    let isManual = requestedManually;
 
     try {
       const result = await analyzeNavigationFrame(
@@ -155,6 +168,7 @@ export default function App() {
         lastSpokenTextRef.current,
         currentGoalRef.current || undefined
       );
+      isManual = isManual || manualScanPendingRef.current;
       setCurrentAnalysis(result);
       setAnalysisHistory((prev) => [result, ...prev.slice(0, 19)]);
 
@@ -217,6 +231,7 @@ export default function App() {
       }
     } finally {
       scanInFlightRef.current = false;
+      manualScanPendingRef.current = false;
       setIsScanning(false);
     }
   }, [rememberSpoken, changeGoal]);

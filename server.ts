@@ -97,8 +97,9 @@ CRITICAL SAFETY & ASSISTIVE RULES:
 6. EXPLICIT UNCERTAINTY: If lighting is dim, glare is high, or camera view is obscured, explicitly note uncertainty. This prototype does not replace a white cane or guide dog.
 7. NO INVENTED DESTINATIONS: ${userIntent ? `The user's goal is: "${userIntent}". Guide them toward it: say where it is relative to them and how to get there safely, hazards first. If it is not visible, tell them which way to turn to look for it. Set goalReached to true only when they are right at it.` : 'The user has NOT told you where they are going. Do not choose a destination for them, and never tell them to go to a door, exit, hallway, or outside. Only describe what is around them and whether the path directly ahead is safe.'}`;
 
-      const promptText = `Analyze this camera view from the smart glasses. Identify all navigation hazards, walking path status, doorways, stairs, obstacles, and people. Provide immediate navigation guidance.`;
+      const promptText = `Analyze this camera view from the smart glasses. Identify navigation hazards, walking path status, doorways, stairs, obstacles, and people. Provide immediate navigation guidance. Be brief: list at most 4 of the most important objects.`;
 
+      const startedAt = Date.now();
       const response = await ai.models.generateContent({
         model: 'gemini-3.8-flash',
         contents: {
@@ -108,7 +109,7 @@ CRITICAL SAFETY & ASSISTIVE RULES:
           systemInstruction,
           responseMimeType: 'application/json',
           thinkingConfig: {
-            thinkingLevel: ThinkingLevel.LOW, // Low thinking for fast navigation latency
+            thinkingLevel: ThinkingLevel.MINIMAL, // A late hazard warning is useless; keep scans fast
           },
           responseSchema: {
             type: Type.OBJECT,
@@ -135,7 +136,7 @@ CRITICAL SAFETY & ASSISTIVE RULES:
               },
               detectedObjects: {
                 type: Type.ARRAY,
-                description: "List of key detected navigation objects and hazards",
+                description: "Up to 4 of the most important navigation objects and hazards, most dangerous first",
                 items: {
                   type: Type.OBJECT,
                   properties: {
@@ -178,6 +179,7 @@ CRITICAL SAFETY & ASSISTIVE RULES:
       });
 
       const parsed = JSON.parse(response.text || '{}');
+      console.log(`Scan took ${Date.now() - startedAt}ms`);
       res.json({
         success: true,
         data: parsed,
