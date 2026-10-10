@@ -42,6 +42,26 @@ interface CameraViewProps {
   isListening?: boolean;
 }
 
+// Small frames upload and get analyzed much faster; 640px is plenty to spot stairs, doors and obstacles
+const MAX_FRAME_DIM = 640;
+const FRAME_JPEG_QUALITY = 0.7;
+let frameCanvas: HTMLCanvasElement | null = null;
+
+function encodeFrame(source: HTMLVideoElement | HTMLCanvasElement): string | null {
+  const srcW = source instanceof HTMLVideoElement ? source.videoWidth : source.width;
+  const srcH = source instanceof HTMLVideoElement ? source.videoHeight : source.height;
+  if (!srcW || !srcH) return null;
+
+  const scale = Math.min(1, MAX_FRAME_DIM / Math.max(srcW, srcH));
+  frameCanvas ??= document.createElement('canvas');
+  frameCanvas.width = Math.round(srcW * scale);
+  frameCanvas.height = Math.round(srcH * scale);
+  const ctx = frameCanvas.getContext('2d');
+  if (!ctx) return null;
+  ctx.drawImage(source, 0, 0, frameCanvas.width, frameCanvas.height);
+  return frameCanvas.toDataURL('image/jpeg', FRAME_JPEG_QUALITY);
+}
+
 export const CameraView: React.FC<CameraViewProps> = ({
   sourceType,
   onSourceChange,
@@ -75,47 +95,17 @@ export const CameraView: React.FC<CameraViewProps> = ({
   // Capture frame function passed to parent
   const captureCurrentFrame = useCallback((): string | null => {
     if (sourceType === 'simulation') {
-      if (!simCanvasRef.current) return null;
-      return simCanvasRef.current.toDataURL('image/jpeg', 0.85);
+      return simCanvasRef.current ? encodeFrame(simCanvasRef.current) : null;
     }
 
     if (sourceType === 'aria_stream') {
-      if (canvasRef.current) {
-        return canvasRef.current.toDataURL('image/jpeg', 0.85);
-      }
-      return null;
+      return canvasRef.current ? encodeFrame(canvasRef.current) : null;
     }
 
     // Default: Webcam / Mobile Camera
-    if (videoRef.current && canvasRef.current) {
-      const video = videoRef.current;
-      const canvas = canvasRef.current;
-      if (video.videoWidth === 0 || video.videoHeight === 0) return null;
-
-      // Downscale to max 800px width/height for fast Gemini Vision transfer
-      const maxDim = 800;
-      let w = video.videoWidth;
-      let h = video.videoHeight;
-      if (w > maxDim || h > maxDim) {
-        if (w > h) {
-          h = Math.round((h * maxDim) / w);
-          w = maxDim;
-        } else {
-          w = Math.round((w * maxDim) / h);
-          h = maxDim;
-        }
-      }
-
-      canvas.width = w;
-      canvas.height = h;
-      const ctx = canvas.getContext('2d');
-      if (ctx) {
-        ctx.drawImage(video, 0, 0, w, h);
-        return canvas.toDataURL('image/jpeg', 0.82);
-      }
-    }
-
-    return null;
+    const video = videoRef.current;
+    if (!video || video.videoWidth === 0 || video.videoHeight === 0) return null;
+    return encodeFrame(video);
   }, [sourceType]);
 
   useEffect(() => {

@@ -172,7 +172,8 @@ export const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
       setIsProcessing(true);
       setBusy(true);
       setLastAskedQuestion(trimmed);
-      speechManager.speak(`Checking: ${trimmed}`);
+      // A short tone instead of reading the question back, so the answer comes sooner
+      soundEffects.playThinking();
 
       try {
         const frame = getFrameRef.current();
@@ -238,6 +239,12 @@ export const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
       transcriptRef.current = current;
       setTranscript(current);
       setInputText(current);
+      // Send as soon as the browser is sure of the words, instead of waiting out the silence
+      if (event.results[event.results.length - 1]?.isFinal) {
+        try {
+          recognition.stop();
+        } catch (_) {}
+      }
     };
 
     recognition.onerror = (event: any) => {

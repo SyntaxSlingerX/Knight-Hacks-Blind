@@ -152,14 +152,19 @@ class SpeechManager {
       if (found) return found;
     }
 
-    // Prefer high quality English voices (Google, Samantha, Daniel, Natural)
-    const preferredNames = ['Google UK English Female', 'Google US English', 'Samantha', 'Daniel', 'Karen', 'Victoria'];
-    for (const name of preferredNames) {
-      const v = this.voices.find((voice) => voice.name.includes(name));
-      if (v) return v;
+    // Prefer voices installed on the device: Chrome's "Google ..." voices stream over the
+    // network and can take a second or more to start talking
+    const english = this.voices.filter((v) => v.lang.startsWith('en'));
+    const local = english.filter((v) => v.localService);
+    const preferredNames = ['Samantha', 'Daniel', 'Karen', 'Victoria', 'Google US English', 'Google UK English Female'];
+    for (const pool of [local, english]) {
+      for (const name of preferredNames) {
+        const v = pool.find((voice) => voice.name.includes(name));
+        if (v) return v;
+      }
     }
 
-    return this.voices.find((v) => v.lang.startsWith('en')) || this.voices[0];
+    return local[0] || english[0] || this.voices[0];
   }
 
   public updateSettings(newSettings: Partial<UserVoiceSettings>): void {

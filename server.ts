@@ -227,6 +227,7 @@ Do not guess. Prioritize safety. Keep answer under 30 words so it can be spoken 
       const systemInstruction = `You are ARIA VISION, answering questions for a blind user wearing smart glasses.
 Always speak clearly, spatially, and concisely. Keep answers suitable for text-to-speech voice output.`;
 
+      const startedAt = Date.now();
       const response = await ai.models.generateContent({
         model: 'gemini-3.8-flash',
         contents: {
@@ -236,7 +237,7 @@ Always speak clearly, spatially, and concisely. Keep answers suitable for text-t
           systemInstruction,
           responseMimeType: 'application/json',
           thinkingConfig: {
-            thinkingLevel: ThinkingLevel.LOW,
+            thinkingLevel: ThinkingLevel.MINIMAL, // Voice answers must feel instant
           },
           responseSchema: {
             type: Type.OBJECT,
@@ -269,6 +270,7 @@ Always speak clearly, spatially, and concisely. Keep answers suitable for text-t
       });
 
       const parsed = JSON.parse(response.text || '{}');
+      console.log(`Voice answer took ${Date.now() - startedAt}ms`);
       res.json({
         success: true,
         data: parsed,

@@ -177,6 +177,29 @@ class SoundEffectsManager {
   }
 
   /**
+   * Thinking Tone: two soft ticks while a voice answer is being prepared
+   */
+  public playThinking(): void {
+    if (!this.enabled) return;
+    const ctx = this.getContext();
+    if (!ctx) return;
+
+    const now = ctx.currentTime;
+    [0, 0.18].forEach((offset) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(740, now + offset);
+      gain.gain.setValueAtTime(0.12, now + offset);
+      gain.gain.exponentialRampToValueAtTime(0.001, now + offset + 0.08);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(now + offset);
+      osc.stop(now + offset + 0.09);
+    });
+  }
+
+  /**
    * Start/Stop System Tone
    */
   public playSystemStatusToggle(active: boolean): void {
