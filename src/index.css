@@ -1,8 +1,15 @@
 @import "tailwindcss";
 
 @layer base {
+  html {
+    scroll-behavior: smooth;
+  }
+
   body {
     font-family: 'Plus Jakarta Sans', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+    background-color: #000000;
+    color: #ffffff;
+    -webkit-font-smoothing: antialiased;
   }
 
   code, pre, kbd {
@@ -10,8 +17,20 @@
   }
 }
 
-/* Custom Accessibility Focus Rings */
+/* WCAG AAA High-Visibility Focus Rings for Visually Impaired Navigation */
 :focus-visible {
-  outline: 3px solid #facc15;
-  outline-offset: 2px;
+  outline: 4px solid #fde047 !important;
+  outline-offset: 3px !important;
+  box-shadow: 0 0 0 6px rgba(0, 0, 0, 0.9), 0 0 18px rgba(253, 224, 71, 0.75) !important;
+}
+
+/* High contrast themes */
+.theme-ultra-yellow {
+  background-color: #000000 !important;
+  color: #fef08a !important;
+}
+
+.theme-high-cyan {
+  background-color: #000000 !important;
+  color: #67e8f9 !important;
 }
