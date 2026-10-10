@@ -27,6 +27,7 @@ export interface NavigationAnalysis {
   soundCue: SoundCueType;
   uncertaintyWarning?: string;
   sceneSummary: string;
+  goalReached?: boolean;
   timestamp: number;
 }
 
@@ -35,6 +36,7 @@ export interface VoiceQueryResponse {
   followUpDirection?: string;
   isObjectFound: boolean;
   safetyNote?: string;
+  navigationGoal?: string;
 }
 
 export type CameraSourceType = 'webcam' | 'aria_stream' | 'simulation';

@@ -24,13 +24,17 @@ export const QUICK_VOICE_QUESTIONS = [
   'Find an empty chair or place to sit',
 ];
 
+export type VoiceCommand = 'start' | 'stop' | 'scan' | 'repeat' | 'clearGoal';
+
 interface VoiceAssistantProps {
   getFrame: () => string | null;
   onAnswerReceived?: (answer: string) => void;
   onListeningStateChange?: (listening: boolean) => void;
   registerToggleListening?: (toggleFn: () => void) => void;
   registerAskQuestion?: (askFn: (q: string) => void) => void;
-  onVoiceCommand?: (command: 'start' | 'stop' | 'scan' | 'repeat') => void;
+  onVoiceCommand?: (command: VoiceCommand) => void;
+  /** Called when a question asks to go somewhere ("Where's the exit?"), with a short name for the place. */
+  onGoalSet?: (goal: string) => void;
   /** True from the moment the mic opens until the spoken answer finishes. */
   onBusyChange?: (busy: boolean) => void;
 }
@@ -46,6 +50,7 @@ export const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
   registerAskQuestion,
   onVoiceCommand,
   onBusyChange,
+  onGoalSet,
 }) => {
   const [isListening, setIsListening] = useState<boolean>(false);
   const [transcript, setTranscript] = useState<string>('');
@@ -75,6 +80,8 @@ export const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
   const onVoiceCommandRef = useRef(onVoiceCommand);
   const onListeningStateChangeRef = useRef(onListeningStateChange);
   const onBusyChangeRef = useRef(onBusyChange);
+  const onGoalSetRef = useRef(onGoalSet);
+  onGoalSetRef.current = onGoalSet;
   getFrameRef.current = getFrame;
   onAnswerReceivedRef.current = onAnswerReceived;
   onVoiceCommandRef.current = onVoiceCommand;
@@ -143,7 +150,7 @@ export const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
 
       // Check for quick hands-free system commands
       const lower = trimmed.toLowerCase().replace(/[.!?]+$/, '');
-      const command =
+      const command: VoiceCommand | null =
         lower === 'start assistance' || lower === 'start navigation'
           ? 'start'
           : lower === 'stop assistance' || lower === 'stop navigation'
@@ -152,6 +159,8 @@ export const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
           ? 'scan'
           : lower === 'repeat' || lower === 'say again'
           ? 'repeat'
+          : ['stop guiding', 'cancel goal', 'clear goal', 'never mind'].includes(lower)
+          ? 'clearGoal'
           : null;
       if (command) {
         setBusy(false);
@@ -174,6 +183,9 @@ export const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
         const textToSpeak = [res.spokenAnswer, res.followUpDirection].filter(Boolean).join(' ');
         speechManager.speak(textToSpeak, { interrupt: true, onEnd: () => setBusy(false) });
         onAnswerReceivedRef.current?.(textToSpeak);
+        if (res.navigationGoal?.trim()) {
+          onGoalSetRef.current?.(res.navigationGoal.trim());
+        }
 
         setInputText('');
         setTranscript('');

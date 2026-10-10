@@ -26,7 +26,7 @@ import {
 } from './types/aria';
 import { CameraView } from './components/CameraView';
 import { NavigationDisplay } from './components/NavigationDisplay';
-import { VoiceAssistant, QUICK_VOICE_QUESTIONS } from './components/VoiceAssistant';
+import { VoiceAssistant, QUICK_VOICE_QUESTIONS, VoiceCommand } from './components/VoiceAssistant';
 import { AccessibilityControls } from './components/AccessibilityControls';
 import { GuidanceHistory } from './components/GuidanceHistory';
 import { AriaSetupModal } from './components/AriaSetupModal';
@@ -110,10 +110,27 @@ export default function App() {
   const lastDirectionRef = useRef<string>('');
   const scanInFlightRef = useRef<boolean>(false);
   const voiceBusyRef = useRef<boolean>(false);
+  // Where the user asked to go ("the exit door"); empty when they haven't asked
+  const [currentGoal, setCurrentGoal] = useState<string>('');
+  const currentGoalRef = useRef<string>('');
   const isMutedRef = useRef<boolean>(isMuted);
   const soundEffectsEnabledRef = useRef<boolean>(voiceSettings.soundEffectsEnabled);
   isMutedRef.current = isMuted;
   soundEffectsEnabledRef.current = voiceSettings.soundEffectsEnabled;
+
+  const changeGoal = useCallback((goal: string) => {
+    currentGoalRef.current = goal;
+    setCurrentGoal(goal);
+    // Make the next scan announce directions toward the new goal
+    lastUrgencyRef.current = '';
+    lastDirectionRef.current = '';
+  }, []);
+
+  const clearGoal = useCallback(() => {
+    if (!currentGoalRef.current) return;
+    changeGoal('');
+    speechManager.speak('Stopped guiding. Describing surroundings only.', { interrupt: true });
+  }, [changeGoal]);
 
   const rememberSpoken = useCallback((text: string) => {
     lastSpokenTextRef.current = text;
@@ -133,7 +150,11 @@ export default function App() {
     }
 
     try {
-      const result = await analyzeNavigationFrame(frame, lastSpokenTextRef.current);
+      const result = await analyzeNavigationFrame(
+        frame,
+        lastSpokenTextRef.current,
+        currentGoalRef.current || undefined
+      );
       setCurrentAnalysis(result);
       setAnalysisHistory((prev) => [result, ...prev.slice(0, 19)]);
 
@@ -142,6 +163,15 @@ export default function App() {
       const directionChanged = result.spatialDirection !== lastDirectionRef.current;
       lastUrgencyRef.current = result.urgency;
       lastDirectionRef.current = result.spatialDirection;
+
+      if (result.goalReached && currentGoalRef.current) {
+        const reached = currentGoalRef.current;
+        changeGoal('');
+        if (!isMutedRef.current) {
+          speechManager.speak(`You have reached ${reached}.`, { interrupt: true });
+        }
+        return;
+      }
 
       // While the user is asking a question, only hazards may interrupt them
       if (voiceBusyRef.current && !isHazard && !isManual) return;
@@ -189,7 +219,7 @@ export default function App() {
       scanInFlightRef.current = false;
       setIsScanning(false);
     }
-  }, [rememberSpoken]);
+  }, [rememberSpoken, changeGoal]);
 
   // Assistance Loop: scan, wait, scan again (never overlapping requests)
   useEffect(() => {
@@ -239,7 +269,7 @@ export default function App() {
 
   // Handle hands-free voice commands from VoiceAssistant
   const handleVoiceCommand = useCallback(
-    (command: 'start' | 'stop' | 'scan' | 'repeat') => {
+    (command: VoiceCommand) => {
       if (command === 'start' && !isAssistanceActiveRef.current) {
         toggleAssistance();
       } else if (command === 'stop' && isAssistanceActiveRef.current) {
@@ -248,9 +278,11 @@ export default function App() {
         performScan(true);
       } else if (command === 'repeat' && lastSpokenTextRef.current) {
         speechManager.speak(lastSpokenTextRef.current, { interrupt: true });
+      } else if (command === 'clearGoal') {
+        clearGoal();
       }
     },
-    [toggleAssistance, performScan]
+    [toggleAssistance, performScan, clearGoal]
   );
 
   // Global Keyboard Accessibility Shortcuts (Spacebar for Voice, 1-6 for Quick Questions, S, Enter, H, M, Esc)
@@ -410,6 +442,29 @@ export default function App() {
 
       {/* Main App Container */}
       <main className="max-w-[1440px] mx-auto px-4 sm:px-6 lg:px-8 py-6 space-y-6">
+        {/* Current destination (set by asking e.g. "Where's the exit?") */}
+        <div role="status" aria-live="polite">
+          {currentGoal && (
+            <div className="flex flex-wrap items-center justify-between gap-3 p-4 md:p-5 rounded-2xl border-4 border-sky-300 bg-sky-950 text-white">
+              <span className="text-lg md:text-2xl font-black">
+                Guiding you to: <span className="text-sky-300">{currentGoal}</span>
+                {!isAssistanceActive && (
+                  <span className="block text-sm md:text-base font-bold text-slate-200">
+                    Start assistance (S) to hear directions.
+                  </span>
+                )}
+              </span>
+              <button
+                onClick={clearGoal}
+                aria-label={`Stop guiding to ${currentGoal}`}
+                className="min-h-[48px] px-4 py-2 rounded-xl bg-white text-black font-black border-2 border-sky-300 hover:bg-sky-100"
+              >
+                STOP GUIDING
+              </button>
+            </div>
+          )}
+        </div>
+
         {/* PRIMARY TACTILE ACTION BAR (Massive, high-contrast buttons for blind & low-vision users) */}
         <section
           aria-label="Primary Navigation and Audio Controls"
@@ -566,6 +621,7 @@ export default function App() {
                 getFrame={() => (captureFrameRef.current ? captureFrameRef.current() : null)}
                 onAnswerReceived={rememberSpoken}
                 onBusyChange={handleVoiceBusyChange}
+                onGoalSet={changeGoal}
                 onListeningStateChange={setIsVoiceListening}
                 registerToggleListening={handleRegisterToggleVoice}
                 registerAskQuestion={handleRegisterAskQuestion}

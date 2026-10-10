@@ -64,7 +64,8 @@ async function startServer() {
    */
   app.post('/api/aria/analyze', async (req, res) => {
     try {
-      const { image, previousGuidance, userIntent } = req.body;
+      const { image, previousGuidance } = req.body;
+      const userIntent = typeof req.body.userIntent === 'string' ? req.body.userIntent.slice(0, 100) : '';
 
       if (!image) {
         return res.status(400).json({ error: 'Image data is required' });
@@ -94,7 +95,7 @@ CRITICAL SAFETY & ASSISTIVE RULES:
    - "informational": Navigational milestone (doorway located, elevator button panel spotted, crosswalk walk sign visible).
 5. REPETITION AVOIDANCE: If previous guidance was '${previousGuidance || 'none'}' and the scene has not significantly changed, keep update minimal or state that the path remains clear.
 6. EXPLICIT UNCERTAINTY: If lighting is dim, glare is high, or camera view is obscured, explicitly note uncertainty. This prototype does not replace a white cane or guide dog.
-7. NO INVENTED DESTINATIONS: ${userIntent ? `The user's goal is: "${userIntent}". Guide them toward it.` : 'The user has NOT told you where they are going. Do not choose a destination for them, and never tell them to go to a door, exit, hallway, or outside. Only describe what is around them and whether the path directly ahead is safe.'}`;
+7. NO INVENTED DESTINATIONS: ${userIntent ? `The user's goal is: "${userIntent}". Guide them toward it: say where it is relative to them and how to get there safely, hazards first. If it is not visible, tell them which way to turn to look for it. Set goalReached to true only when they are right at it.` : 'The user has NOT told you where they are going. Do not choose a destination for them, and never tell them to go to a door, exit, hallway, or outside. Only describe what is around them and whether the path directly ahead is safe.'}`;
 
       const promptText = `Analyze this camera view from the smart glasses. Identify all navigation hazards, walking path status, doorways, stairs, obstacles, and people. Provide immediate navigation guidance.`;
 
@@ -157,6 +158,10 @@ CRITICAL SAFETY & ASSISTIVE RULES:
               sceneSummary: {
                 type: Type.STRING,
                 description: "One sentence overview of the environment",
+              },
+              goalReached: {
+                type: Type.BOOLEAN,
+                description: "True only if the user has a goal and is now right at it (e.g. standing at the exit door)",
               },
             },
             required: [
@@ -251,6 +256,11 @@ Always speak clearly, spatially, and concisely. Keep answers suitable for text-t
               safetyNote: {
                 type: Type.STRING,
                 description: "Important safety warning regarding the query (e.g. 'Check floor with cane')",
+              },
+              navigationGoal: {
+                type: Type.STRING,
+                description:
+                  "If the user wants to go to or find a place or object (e.g. 'Where is the exit?' -> 'the exit door', 'Find a chair' -> 'an empty chair'), a short name for it. Empty string for any other question.",
               },
             },
             required: ['spokenAnswer', 'isObjectFound'],

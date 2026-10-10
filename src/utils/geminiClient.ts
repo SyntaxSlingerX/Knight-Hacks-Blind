@@ -2,7 +2,8 @@ import { NavigationAnalysis, VoiceQueryResponse } from '../types/aria';
 
 export async function analyzeNavigationFrame(
   base64Image: string,
-  previousGuidance?: string
+  previousGuidance?: string,
+  userIntent?: string
 ): Promise<NavigationAnalysis> {
   const response = await fetch('/api/aria/analyze', {
     method: 'POST',
@@ -10,6 +11,7 @@ export async function analyzeNavigationFrame(
     body: JSON.stringify({
       image: base64Image,
       previousGuidance,
+      userIntent,
     }),
   });
 
