@@ -150,7 +150,7 @@ export const NavigationDisplay: React.FC<NavigationDisplayProps> = ({
               analysis.immediateAlert
                 ? `${analysis.immediateAlert}. ${analysis.spokenGuidance}`
                 : analysis.spokenGuidance,
-              { isUrgent: true }
+              { interrupt: true }
             )
           }
           aria-label="Speak current guidance aloud again"

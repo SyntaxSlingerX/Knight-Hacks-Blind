@@ -31,7 +31,12 @@ interface VoiceAssistantProps {
   registerToggleListening?: (toggleFn: () => void) => void;
   registerAskQuestion?: (askFn: (q: string) => void) => void;
   onVoiceCommand?: (command: 'start' | 'stop' | 'scan' | 'repeat') => void;
+  /** True from the moment the mic opens until the spoken answer finishes. */
+  onBusyChange?: (busy: boolean) => void;
 }
+
+// If an answer's speech never reports finishing, release the busy state anyway
+const BUSY_SAFETY_MS = 30000;
 
 export const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
   getFrame,
@@ -40,6 +45,7 @@ export const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
   registerToggleListening,
   registerAskQuestion,
   onVoiceCommand,
+  onBusyChange,
 }) => {
   const [isListening, setIsListening] = useState<boolean>(false);
   const [transcript, setTranscript] = useState<string>('');
@@ -59,9 +65,32 @@ export const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
   const audioStreamRef = useRef<MediaStream | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
 
-  useEffect(() => {
-    isProcessingRef.current = isProcessing;
-  }, [isProcessing]);
+  const micBlockedRef = useRef<boolean>(false);
+  const busyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Keep the latest props in refs so the speech recognizer (created once) never goes stale
+  // and isn't torn down mid-question whenever the parent re-renders
+  const getFrameRef = useRef(getFrame);
+  const onAnswerReceivedRef = useRef(onAnswerReceived);
+  const onVoiceCommandRef = useRef(onVoiceCommand);
+  const onListeningStateChangeRef = useRef(onListeningStateChange);
+  const onBusyChangeRef = useRef(onBusyChange);
+  getFrameRef.current = getFrame;
+  onAnswerReceivedRef.current = onAnswerReceived;
+  onVoiceCommandRef.current = onVoiceCommand;
+  onListeningStateChangeRef.current = onListeningStateChange;
+  onBusyChangeRef.current = onBusyChange;
+
+  const setBusy = useCallback((busy: boolean) => {
+    if (busyTimerRef.current) {
+      clearTimeout(busyTimerRef.current);
+      busyTimerRef.current = null;
+    }
+    if (busy) {
+      busyTimerRef.current = setTimeout(() => onBusyChangeRef.current?.(false), BUSY_SAFETY_MS);
+    }
+    onBusyChangeRef.current?.(busy);
+  }, []);
 
   const stopAudioMeter = useCallback(() => {
     if (audioAnimRef.current) {
@@ -113,37 +142,38 @@ export const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
       if (!trimmed || isProcessingRef.current) return;
 
       // Check for quick hands-free system commands
-      const lower = trimmed.toLowerCase();
-      if (lower === 'start assistance' || lower === 'start navigation') {
-        onVoiceCommand?.('start');
-        return;
-      }
-      if (lower === 'stop assistance' || lower === 'stop navigation') {
-        onVoiceCommand?.('stop');
-        return;
-      }
-      if (lower === 'scan now' || lower === 'scan scene') {
-        onVoiceCommand?.('scan');
-        return;
-      }
-      if (lower === 'repeat' || lower === 'say again') {
-        onVoiceCommand?.('repeat');
+      const lower = trimmed.toLowerCase().replace(/[.!?]+$/, '');
+      const command =
+        lower === 'start assistance' || lower === 'start navigation'
+          ? 'start'
+          : lower === 'stop assistance' || lower === 'stop navigation'
+          ? 'stop'
+          : lower === 'scan now' || lower === 'scan scene'
+          ? 'scan'
+          : lower === 'repeat' || lower === 'say again'
+          ? 'repeat'
+          : null;
+      if (command) {
+        setBusy(false);
+        onVoiceCommandRef.current?.(command);
         return;
       }
 
+      isProcessingRef.current = true;
       setIsProcessing(true);
+      setBusy(true);
       setLastAskedQuestion(trimmed);
       speechManager.speak(`Checking: ${trimmed}`);
 
       try {
-        const frame = getFrame();
+        const frame = getFrameRef.current();
         const res = await askNavigationQuestion(frame, trimmed);
         setLastResponse(res);
 
         // Speak answer aloud immediately with high clarity
-        const textToSpeak = `${res.spokenAnswer} ${res.followUpDirection || ''}`;
-        speechManager.speak(textToSpeak, { isUrgent: true });
-        onAnswerReceived?.(textToSpeak);
+        const textToSpeak = [res.spokenAnswer, res.followUpDirection].filter(Boolean).join(' ');
+        speechManager.speak(textToSpeak, { interrupt: true, onEnd: () => setBusy(false) });
+        onAnswerReceivedRef.current?.(textToSpeak);
 
         setInputText('');
         setTranscript('');
@@ -151,13 +181,16 @@ export const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
       } catch (err: any) {
         console.error('Error querying voice:', err);
         const errMsg = 'Sorry, I could not analyze the camera view right now. Please try again.';
-        speechManager.speak(errMsg, { isUrgent: true });
+        speechManager.speak(errMsg, { interrupt: true, onEnd: () => setBusy(false) });
       } finally {
+        isProcessingRef.current = false;
         setIsProcessing(false);
       }
     },
-    [getFrame, onAnswerReceived, onVoiceCommand]
+    [setBusy]
   );
+  const handleSendQuestionRef = useRef(handleSendQuestion);
+  handleSendQuestionRef.current = handleSendQuestion;
 
   // Initialize Web Speech Recognition once without aborting on transcript updates
   useEffect(() => {
@@ -180,7 +213,7 @@ export const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
       isListeningRef.current = true;
       setIsListening(true);
       setMicError(null);
-      onListeningStateChange?.(true);
+      onListeningStateChangeRef.current?.(true);
       soundEffects.playMicListening();
       startAudioMeter();
     };
@@ -199,10 +232,11 @@ export const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
       console.warn('Speech recognition error:', event.error);
       isListeningRef.current = false;
       setIsListening(false);
-      onListeningStateChange?.(false);
+      onListeningStateChangeRef.current?.(false);
       stopAudioMeter();
       soundEffects.playMicEnded();
-      if (event.error === 'not-allowed') {
+      if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
+        micBlockedRef.current = true;
         const msg = 'Microphone access blocked. Please allow microphone permission in your browser address bar, or use the large quick question buttons below.';
         setMicError(msg);
         speechManager.speak('Microphone permission is blocked. Please allow microphone access or press keys 1 through 6 to ask a question.');
@@ -212,27 +246,36 @@ export const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
     recognition.onend = () => {
       isListeningRef.current = false;
       setIsListening(false);
-      onListeningStateChange?.(false);
+      onListeningStateChangeRef.current?.(false);
       stopAudioMeter();
       soundEffects.playMicEnded();
 
       const captured = transcriptRef.current.trim();
+      transcriptRef.current = '';
       if (captured.length > 1) {
-        handleSendQuestion(captured);
+        handleSendQuestionRef.current(captured);
+      } else if (micBlockedRef.current) {
+        micBlockedRef.current = false;
+        setBusy(false);
+      } else if (!isProcessingRef.current) {
+        speechManager.speak("I didn't catch that. Press space and try again.", {
+          interrupt: true,
+          onEnd: () => setBusy(false),
+        });
       }
     };
 
     recognitionRef.current = recognition;
 
     return () => {
+      recognition.onend = null;
       stopAudioMeter();
-      if (recognitionRef.current) {
-        try {
-          recognitionRef.current.abort();
-        } catch (_) {}
-      }
+      try {
+        recognition.abort();
+      } catch (_) {}
+      if (busyTimerRef.current) clearTimeout(busyTimerRef.current);
     };
-  }, [handleSendQuestion, onListeningStateChange, startAudioMeter, stopAudioMeter]);
+  }, [startAudioMeter, stopAudioMeter, setBusy]);
 
   const toggleListening = useCallback(() => {
     if (!speechSupported) {
@@ -249,6 +292,7 @@ export const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
     } else {
       // Stop any ongoing TTS speech so it doesn't get picked up by the mic
       speechManager.stop();
+      setBusy(true);
       transcriptRef.current = '';
       setTranscript('');
       setMicError(null);
@@ -256,9 +300,10 @@ export const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
         recognitionRef.current?.start();
       } catch (err) {
         console.warn('Could not start speech recognition:', err);
+        setBusy(false);
       }
     }
-  }, [speechSupported]);
+  }, [speechSupported, setBusy]);
 
   // Register callbacks with parent App so Spacebar & Top Bar buttons can trigger voice
   useEffect(() => {
@@ -425,7 +470,7 @@ export const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
               onClick={() =>
                 speechManager.speak(
                   `${lastResponse.spokenAnswer} ${lastResponse.followUpDirection || ''}`,
-                  { isUrgent: true }
+                  { interrupt: true }
                 )
               }
               aria-label="Repeat spoken answer aloud"

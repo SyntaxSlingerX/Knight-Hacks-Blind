@@ -80,7 +80,7 @@ export const GuidanceHistory: React.FC<GuidanceHistoryProps> = ({ history, onCle
 
                 <button
                   onClick={() =>
-                    speechManager.speak(item.immediateAlert || item.spokenGuidance, { isUrgent: true })
+                    speechManager.speak(item.immediateAlert || item.spokenGuidance, { interrupt: true })
                   }
                   aria-label="Replay audio announcement"
                   className="p-3 bg-amber-400 hover:bg-amber-300 text-black font-black rounded-xl border-2 border-white transition-colors shrink-0 min-h-[48px] min-w-[48px] flex items-center justify-center"

@@ -22,7 +22,7 @@ export const SafetyDisclaimer: React.FC = () => {
 
         <div className="flex items-center gap-2">
           <button
-            onClick={() => speechManager.speak(safetyText, { isUrgent: true })}
+            onClick={() => speechManager.speak(safetyText, { interrupt: true })}
             aria-label="Read safety notice aloud"
             className="px-3 py-1.5 bg-slate-900 hover:bg-slate-800 text-amber-300 border border-amber-400/60 rounded-xl text-xs font-extrabold flex items-center gap-1.5"
           >
