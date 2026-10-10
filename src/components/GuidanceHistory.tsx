@@ -10,29 +10,31 @@ interface GuidanceHistoryProps {
 
 export const GuidanceHistory: React.FC<GuidanceHistoryProps> = ({ history, onClear }) => {
   return (
-    <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 md:p-6 shadow-xl flex flex-col gap-4">
-      <div className="flex items-center justify-between border-b border-slate-800 pb-3">
-        <div className="flex items-center gap-2">
-          <History className="w-5 h-5 text-amber-400" />
-          <h3 className="text-base font-bold text-white">Navigation Log & Spoken History</h3>
+    <div className="bg-slate-950 border-2 border-slate-700 rounded-3xl p-5 md:p-6 shadow-2xl flex flex-col gap-4">
+      <div className="flex items-center justify-between border-b-2 border-slate-800 pb-3">
+        <div className="flex items-center gap-2.5">
+          <History className="w-6 h-6 text-amber-400" />
+          <h2 className="text-lg md:text-xl font-black text-white uppercase tracking-wide">
+            Spoken Guidance Log
+          </h2>
         </div>
         {history.length > 0 && (
           <button
             onClick={onClear}
-            className="flex items-center gap-1 text-xs text-slate-400 hover:text-red-400 transition-colors"
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-slate-900 border border-slate-700 text-xs font-extrabold text-slate-200 hover:text-red-300 hover:border-red-400 transition-colors"
           >
-            <Trash2 className="w-3.5 h-3.5" />
-            <span>Clear</span>
+            <Trash2 className="w-4 h-4" />
+            <span>CLEAR LOG</span>
           </button>
         )}
       </div>
 
       {history.length === 0 ? (
-        <div className="text-center py-6 text-slate-500 text-xs">
-          No spoken announcements yet. Start assistance to see live updates.
+        <div className="text-center py-8 text-slate-300 font-bold text-sm md:text-base">
+          No spoken announcements yet. Start assistance or scan the scene to hear live updates.
         </div>
       ) : (
-        <div className="space-y-2.5 max-h-[260px] overflow-y-auto pr-1">
+        <div className="space-y-3 max-h-[320px] overflow-y-auto pr-1">
           {history.map((item, idx) => {
             const isHazard = item.urgency === 'immediate_hazard';
             const isCaution = item.urgency === 'caution';
@@ -45,41 +47,45 @@ export const GuidanceHistory: React.FC<GuidanceHistoryProps> = ({ history, onCle
             return (
               <div
                 key={idx}
-                className={`p-3 rounded-xl border text-xs flex items-start justify-between gap-3 transition-colors ${
+                className={`p-4 rounded-2xl border-2 text-sm md:text-base flex items-start justify-between gap-3 transition-colors ${
                   isHazard
-                    ? 'bg-red-950/40 border-red-700/60 text-red-200'
+                    ? 'bg-red-950/70 border-red-500 text-white'
                     : isCaution
-                    ? 'bg-amber-950/30 border-amber-700/50 text-amber-200'
-                    : 'bg-slate-950/60 border-slate-800 text-slate-300'
+                    ? 'bg-amber-950/60 border-amber-400 text-white'
+                    : 'bg-black border-slate-700 text-white'
                 }`}
               >
-                <div className="flex-1 space-y-1">
+                <div className="flex-1 space-y-1.5">
                   <div className="flex items-center gap-2">
                     {isHazard ? (
-                      <ShieldAlert className="w-3.5 h-3.5 text-red-400" />
+                      <ShieldAlert className="w-5 h-5 text-red-400 shrink-0" />
                     ) : (
-                      <CheckCircle className="w-3.5 h-3.5 text-emerald-400" />
+                      <CheckCircle className="w-5 h-5 text-emerald-400 shrink-0" />
                     )}
-                    <span className="font-mono text-[10px] text-slate-400">{timeStr}</span>
-                    <span className="font-bold uppercase text-[10px] tracking-wider text-slate-300">
+                    <span className="font-mono text-xs font-bold text-yellow-300">{timeStr}</span>
+                    <span className="font-black uppercase text-xs tracking-wider bg-slate-900 px-2 py-0.5 rounded border border-slate-700 text-white">
                       {item.spatialDirection.replace('_', ' ')}
                     </span>
                   </div>
 
-                  <p className="font-medium leading-relaxed">
+                  <p className="font-extrabold leading-snug text-base md:text-lg">
                     {item.immediateAlert ? (
-                      <span className="font-bold block text-red-300">{item.immediateAlert}</span>
+                      <span className="font-black block text-red-300 uppercase mb-0.5">
+                        {item.immediateAlert}
+                      </span>
                     ) : null}
                     "{item.spokenGuidance}"
                   </p>
                 </div>
 
                 <button
-                  onClick={() => speechManager.speak(item.immediateAlert || item.spokenGuidance)}
+                  onClick={() =>
+                    speechManager.speak(item.immediateAlert || item.spokenGuidance, { interrupt: true })
+                  }
                   aria-label="Replay audio announcement"
-                  className="p-2 bg-slate-800 hover:bg-slate-700 text-amber-400 rounded-lg transition-colors shrink-0"
+                  className="p-3 bg-amber-400 hover:bg-amber-300 text-black font-black rounded-xl border-2 border-white transition-colors shrink-0 min-h-[48px] min-w-[48px] flex items-center justify-center"
                 >
-                  <Volume2 className="w-3.5 h-3.5" />
+                  <Volume2 className="w-5 h-5" />
                 </button>
               </div>
             );

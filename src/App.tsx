@@ -10,15 +10,11 @@ import {
   Square,
   Scan,
   Mic,
-  Settings,
+  MicOff,
   Volume2,
   VolumeX,
   Radio,
-  Wifi,
-  WifiOff,
-  Sliders,
-  CheckCircle2,
-  AlertCircle
+  Eye,
 } from 'lucide-react';
 import {
   CameraSourceType,
@@ -30,7 +26,7 @@ import {
 } from './types/aria';
 import { CameraView } from './components/CameraView';
 import { NavigationDisplay } from './components/NavigationDisplay';
-import { VoiceAssistant } from './components/VoiceAssistant';
+import { VoiceAssistant, QUICK_VOICE_QUESTIONS } from './components/VoiceAssistant';
 import { AccessibilityControls } from './components/AccessibilityControls';
 import { GuidanceHistory } from './components/GuidanceHistory';
 import { AriaSetupModal } from './components/AriaSetupModal';
@@ -48,11 +44,14 @@ export default function App() {
   // Navigation & Assistance State
   const [isAssistanceActive, setIsAssistanceActive] = useState<boolean>(false);
   const [isScanning, setIsScanning] = useState<boolean>(false);
+  const [isVoiceListening, setIsVoiceListening] = useState<boolean>(false);
   const [currentAnalysis, setCurrentAnalysis] = useState<NavigationAnalysis | null>(null);
   const [analysisHistory, setAnalysisHistory] = useState<NavigationAnalysis[]>([]);
+  const [lastSpokenText, setLastSpokenText] = useState<string>('');
 
-  // Camera & Aria Config
+  // Camera & Aria Config (Prominent display state)
   const [cameraSource, setCameraSource] = useState<CameraSourceType>('simulation');
+  const [isCameraExpanded, setIsCameraExpanded] = useState<boolean>(false);
   const [ariaConfig, setAriaConfig] = useState<AriaConnectionConfig>({
     streamUrl: 'ws://localhost:7000',
     connected: false,
@@ -62,9 +61,9 @@ export default function App() {
   });
   const [isAriaModalOpen, setIsAriaModalOpen] = useState<boolean>(false);
 
-  // Accessibility Settings
+  // Accessibility Settings (Default to xlarge text for visually impaired users)
   const [themeMode, setThemeMode] = useState<ThemeMode>('standard-dark');
-  const [textSize, setTextSize] = useState<TextSize>('large');
+  const [textSize, setTextSize] = useState<TextSize>('xlarge');
   const [voiceSettings, setVoiceSettings] = useState<UserVoiceSettings>({
     rate: 1.15,
     pitch: 1.0,
@@ -73,24 +72,34 @@ export default function App() {
   });
   const [isMuted, setIsMuted] = useState<boolean>(false);
 
-  // Frame capture function reference from CameraView
+  // References for Camera capture and Voice Assistant triggers
   const captureFrameRef = useRef<(() => string | null) | null>(null);
+  const toggleVoiceRef = useRef<(() => void) | null>(null);
+  const askQuestionRef = useRef<((q: string) => void) | null>(null);
   const scanTimerRef = useRef<any>(null);
 
   const handleFrameCaptureReady = useCallback((captureFn: () => string | null) => {
     captureFrameRef.current = captureFn;
   }, []);
 
-  // Theme container classes
+  const handleRegisterToggleVoice = useCallback((toggleFn: () => void) => {
+    toggleVoiceRef.current = toggleFn;
+  }, []);
+
+  const handleRegisterAskQuestion = useCallback((askFn: (q: string) => void) => {
+    askQuestionRef.current = askFn;
+  }, []);
+
+  // Theme container classes with WCAG AAA high contrast
   const getThemeContainerClass = () => {
     switch (themeMode) {
       case 'ultra-contrast-yellow':
-        return 'bg-black text-yellow-300 [&_*]:border-yellow-400 [&_button]:border-yellow-400';
+        return 'bg-black text-yellow-300 [&_*]:border-yellow-400';
       case 'high-contrast-cyan':
-        return 'bg-black text-cyan-300 [&_*]:border-cyan-400 [&_button]:border-cyan-400';
+        return 'bg-black text-cyan-300 [&_*]:border-cyan-400';
       case 'standard-dark':
       default:
-        return 'bg-slate-950 text-slate-100';
+        return 'bg-black text-white';
     }
   };
 
@@ -106,6 +115,11 @@ export default function App() {
   isMutedRef.current = isMuted;
   soundEffectsEnabledRef.current = voiceSettings.soundEffectsEnabled;
 
+  const rememberSpoken = useCallback((text: string) => {
+    lastSpokenTextRef.current = text;
+    setLastSpokenText(text);
+  }, []);
+
   // Perform single vision frame scan
   const performScan = useCallback(async (isManual: boolean = false) => {
     if (!captureFrameRef.current || scanInFlightRef.current) return;
@@ -114,6 +128,10 @@ export default function App() {
 
     scanInFlightRef.current = true;
     setIsScanning(true);
+    if (isManual && !isMutedRef.current) {
+      speechManager.speak('Scanning scene.', { interrupt: true });
+    }
+
     try {
       const result = await analyzeNavigationFrame(frame, lastSpokenTextRef.current);
       setCurrentAnalysis(result);
@@ -156,9 +174,9 @@ export default function App() {
         (isStale && textToSpeak !== lastSpokenTextRef.current);
 
       if (shouldSpeak) {
-        lastSpokenTextRef.current = textToSpeak;
+        rememberSpoken(textToSpeak);
         lastSpokenAtRef.current = Date.now();
-        if (!muted && !(voiceBusyRef.current && isHazard && !isManual)) {
+        if (!muted) {
           speechManager.speak(textToSpeak, { isUrgent: isHazard, interrupt: isManual });
         }
       }
@@ -171,7 +189,7 @@ export default function App() {
       scanInFlightRef.current = false;
       setIsScanning(false);
     }
-  }, []);
+  }, [rememberSpoken]);
 
   // Assistance Loop: scan, wait, scan again (never overlapping requests)
   useEffect(() => {
@@ -219,22 +237,40 @@ export default function App() {
     }
   }, []);
 
-  // Keyboard Accessibility Shortcuts
+  // Handle hands-free voice commands from VoiceAssistant
+  const handleVoiceCommand = useCallback(
+    (command: 'start' | 'stop' | 'scan' | 'repeat') => {
+      if (command === 'start' && !isAssistanceActiveRef.current) {
+        toggleAssistance();
+      } else if (command === 'stop' && isAssistanceActiveRef.current) {
+        toggleAssistance();
+      } else if (command === 'scan') {
+        performScan(true);
+      } else if (command === 'repeat' && lastSpokenTextRef.current) {
+        speechManager.speak(lastSpokenTextRef.current, { interrupt: true });
+      }
+    },
+    [toggleAssistance, performScan]
+  );
+
+  // Global Keyboard Accessibility Shortcuts (Spacebar for Voice, 1-6 for Quick Questions, S, Enter, H, M, Esc)
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement;
-      // Don't hijack typing, or Enter/Space on a focused button or link
-      if (
-        e.metaKey ||
-        e.ctrlKey ||
-        e.altKey ||
-        target.isContentEditable ||
-        ['INPUT', 'TEXTAREA', 'SELECT', 'BUTTON', 'A'].includes(target.tagName)
-      ) {
-        if (e.code !== 'Escape') return;
+      // Don't trigger global hotkeys if user is typing in a text input
+      if (['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName) || target.isContentEditable) {
+        return;
+      }
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      // Let Space/Enter press a focused button or link instead of firing a shortcut
+      if ((e.code === 'Space' || e.code === 'Enter') && ['BUTTON', 'A'].includes(target.tagName)) {
+        return;
       }
 
-      if (e.code === 'KeyS') {
+      if (e.code === 'Space') {
+        e.preventDefault();
+        toggleVoiceRef.current?.();
+      } else if (e.code === 'KeyS') {
         e.preventDefault();
         toggleAssistance();
       } else if (e.code === 'Enter') {
@@ -242,11 +278,32 @@ export default function App() {
         performScan(true);
       } else if (e.code === 'KeyH') {
         e.preventDefault();
-        setThemeMode((prev) =>
-          prev === 'standard-dark' ? 'ultra-contrast-yellow' : 'standard-dark'
-        );
+        setThemeMode((prev) => {
+          const next =
+            prev === 'standard-dark'
+              ? 'ultra-contrast-yellow'
+              : prev === 'ultra-contrast-yellow'
+              ? 'high-contrast-cyan'
+              : 'standard-dark';
+          speechManager.speak(`Contrast mode: ${next.replace(/-/g, ' ')}`);
+          return next;
+        });
+      } else if (e.code === 'KeyM') {
+        e.preventDefault();
+        setIsMuted((prev) => {
+          const next = !prev;
+          if (next) speechManager.stop();
+          return next;
+        });
       } else if (e.code === 'Escape') {
+        e.preventDefault();
         speechManager.stop();
+      } else if (['Digit1', 'Digit2', 'Digit3', 'Digit4', 'Digit5', 'Digit6'].includes(e.code)) {
+        e.preventDefault();
+        const index = parseInt(e.code.replace('Digit', ''), 10) - 1;
+        if (QUICK_VOICE_QUESTIONS[index]) {
+          askQuestionRef.current?.(QUICK_VOICE_QUESTIONS[index]);
+        }
       }
     };
 
@@ -255,137 +312,238 @@ export default function App() {
   }, [toggleAssistance, performScan]);
 
   return (
-    <div className={`min-h-screen transition-colors duration-200 ${getThemeContainerClass()}`}>
-      {/* 
-        Top Bar Contract:
-        [Brand title, one line] — [4–5 nav links, 1–2 word labels, single-line] — [1 primary action]
-      */}
-      <header className="sticky top-0 z-40 bg-slate-950/90 backdrop-blur-md border-b border-slate-800">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between gap-8">
-          {/* Zone 1: Single element brand wordmark */}
-          <div className="flex items-center gap-2.5 shrink-0">
-            <div className="p-2 bg-amber-400 text-slate-950 rounded-xl">
-              <Glasses className="w-5 h-5" />
+    <div className={`min-h-screen transition-colors duration-200 pb-24 ${getThemeContainerClass()}`}>
+      {/* Screen-Reader & Keyboard Skip Navigation Links */}
+      <div className="sr-only focus-within:not-sr-only focus-within:fixed focus-within:top-2 focus-within:left-2 focus-within:z-50 flex gap-2 bg-black p-2 border-2 border-yellow-300 rounded-xl">
+        <a
+          href="#voice-qa"
+          className="px-4 py-2 bg-amber-400 text-black font-black rounded-lg"
+        >
+          Skip to Audio Voice Input
+        </a>
+        <a
+          href="#feed"
+          className="px-4 py-2 bg-amber-400 text-black font-black rounded-lg"
+        >
+          Skip to Camera Display
+        </a>
+      </div>
+
+      {/* High-Visibility Sticky Header */}
+      <header className="sticky top-0 z-40 bg-black/95 backdrop-blur-md border-b-2 border-slate-800">
+        <div className="max-w-[1440px] mx-auto px-4 sm:px-6 lg:px-8 h-20 flex items-center justify-between gap-4">
+          {/* Brand Title */}
+          <div className="flex items-center gap-3 shrink-0">
+            <div className="p-2.5 bg-amber-400 text-black rounded-2xl border-2 border-white">
+              <Glasses className="w-7 h-7 stroke-[2.5]" />
             </div>
-            <span className="text-lg font-extrabold tracking-tight text-white whitespace-nowrap">
-              Aria Vision
-            </span>
+            <div>
+              <span className="text-xl md:text-2xl font-black tracking-tight text-white uppercase block leading-none">
+                Aria Vision
+              </span>
+              <span className="text-xs font-extrabold text-amber-300 tracking-wider uppercase">
+                Blind & Low-Vision Assistant
+              </span>
+            </div>
           </div>
 
-          {/* Zone 2: 4-5 single-line clean nav links */}
-          <nav className="hidden md:flex items-center gap-6 text-sm font-medium text-slate-400">
-            <a href="#feed" className="hover:text-white transition-colors whitespace-nowrap shrink-0">
-              Camera Feed
+          {/* High-Contrast Section Jump Links */}
+          <nav
+            aria-label="Quick Page Sections"
+            className="hidden lg:flex items-center gap-3 text-sm font-black uppercase tracking-wider"
+          >
+            <a
+              href="#feed"
+              className="px-3.5 py-2 rounded-xl bg-slate-900 text-white hover:bg-amber-400 hover:text-black border border-slate-700 transition-colors"
+            >
+              1. Camera Display
             </a>
-            <a href="#guidance" className="hover:text-white transition-colors whitespace-nowrap shrink-0">
-              Voice Guidance
+            <a
+              href="#voice-qa"
+              className="px-3.5 py-2 rounded-xl bg-slate-900 text-amber-300 hover:bg-amber-400 hover:text-black border border-amber-400/60 transition-colors"
+            >
+              2. Audio Voice Input
             </a>
-            <a href="#voice-qa" className="hover:text-white transition-colors whitespace-nowrap shrink-0">
-              Voice Inquiries
+            <a
+              href="#guidance"
+              className="px-3.5 py-2 rounded-xl bg-slate-900 text-white hover:bg-amber-400 hover:text-black border border-slate-700 transition-colors"
+            >
+              3. Spoken Guidance
             </a>
-            <a href="#controls" className="hover:text-white transition-colors whitespace-nowrap shrink-0">
-              Accessibility
+            <a
+              href="#controls"
+              className="px-3.5 py-2 rounded-xl bg-slate-900 text-white hover:bg-amber-400 hover:text-black border border-slate-700 transition-colors"
+            >
+              4. Visual Settings
             </a>
           </nav>
 
-          {/* Zone 3: 1 primary action */}
-          <div className="flex items-center gap-3 shrink-0">
+          {/* Quick Contrast Toggle & Aria Glasses Connection */}
+          <div className="flex items-center gap-2.5 shrink-0">
+            <button
+              onClick={() =>
+                setThemeMode((prev) =>
+                  prev === 'standard-dark'
+                    ? 'ultra-contrast-yellow'
+                    : prev === 'ultra-contrast-yellow'
+                    ? 'high-contrast-cyan'
+                    : 'standard-dark'
+                )
+              }
+              aria-label="Cycle high contrast color theme (Shortcut H)"
+              className="px-3.5 py-2.5 text-xs md:text-sm font-black text-yellow-300 bg-slate-900 hover:bg-slate-800 border-2 border-yellow-400 rounded-xl transition-all flex items-center gap-1.5 min-h-[46px]"
+            >
+              <Eye className="w-4 h-4" />
+              <span className="hidden sm:inline">Contrast [H]</span>
+            </button>
+
             <button
               onClick={() => setIsAriaModalOpen(true)}
-              className="px-4 py-2 text-xs font-bold text-slate-950 bg-amber-400 hover:bg-amber-300 rounded-xl transition-all shadow-md active:scale-95 whitespace-nowrap flex items-center gap-1.5"
+              className="px-4 py-2.5 text-xs md:text-sm font-black text-black bg-amber-400 hover:bg-amber-300 border-2 border-white rounded-xl transition-all shadow-md active:scale-95 whitespace-nowrap flex items-center gap-2 min-h-[46px]"
             >
-              <Radio className="w-3.5 h-3.5" />
-              <span>Connect Aria</span>
+              <Radio className="w-4 h-4 stroke-[2.5]" />
+              <span>Connect Glasses</span>
             </button>
           </div>
         </div>
       </header>
 
       {/* Main App Container */}
-      <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 space-y-6">
-        {/* Safety Disclaimer Banner */}
-        <SafetyDisclaimer />
-
-        {/* PRIMARY TACTILE ACTION CONTROLS (Ergonomic, accessible, huge touch targets) */}
+      <main className="max-w-[1440px] mx-auto px-4 sm:px-6 lg:px-8 py-6 space-y-6">
+        {/* PRIMARY TACTILE ACTION BAR (Massive, high-contrast buttons for blind & low-vision users) */}
         <section
-          aria-label="Primary Navigation Actions"
-          className="grid grid-cols-1 sm:grid-cols-3 gap-3.5"
+          aria-label="Primary Navigation and Audio Controls"
+          className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4"
         >
-          {/* Action 1: START / STOP ASSISTANCE */}
+          {/* Action 1: START / STOP CONTINUOUS ASSISTANCE */}
           <button
             onClick={toggleAssistance}
-            aria-label={isAssistanceActive ? 'Stop Navigation Assistance' : 'Start Navigation Assistance'}
-            className={`min-h-[68px] px-6 py-4 rounded-2xl font-extrabold flex items-center justify-center gap-3 text-base md:text-lg transition-all shadow-xl active:scale-[0.98] ${
+            aria-label={
               isAssistanceActive
-                ? 'bg-red-600 hover:bg-red-700 text-white ring-4 ring-red-500/30 animate-pulse'
-                : 'bg-emerald-500 hover:bg-emerald-400 text-slate-950 shadow-emerald-500/20'
+                ? 'Stop Continuous Navigation Assistance. Shortcut S'
+                : 'Start Continuous Navigation Assistance. Shortcut S'
+            }
+            aria-pressed={isAssistanceActive}
+            className={`min-h-[84px] px-5 py-4 rounded-2xl font-black flex items-center justify-between gap-3 text-lg md:text-xl transition-all shadow-2xl border-4 active:scale-[0.98] cursor-pointer ${
+              isAssistanceActive
+                ? 'bg-red-600 hover:bg-red-700 text-white border-white ring-4 ring-red-500/40'
+                : 'bg-emerald-400 hover:bg-emerald-300 text-black border-white'
             }`}
           >
-            {isAssistanceActive ? (
-              <>
-                <Square className="w-6 h-6 fill-current" />
-                <span>STOP ASSISTANCE</span>
-              </>
-            ) : (
-              <>
-                <Play className="w-6 h-6 fill-current" />
-                <span>START ASSISTANCE</span>
-              </>
-            )}
+            <div className="flex items-center gap-3">
+              {isAssistanceActive ? (
+                <Square className="w-8 h-8 fill-current shrink-0" />
+              ) : (
+                <Play className="w-8 h-8 fill-current shrink-0" />
+              )}
+              <span className="text-left leading-tight">
+                {isAssistanceActive ? 'STOP ASSISTANCE' : 'START ASSISTANCE'}
+              </span>
+            </div>
+            <kbd className="px-2.5 py-1 text-xs font-mono font-black bg-black/80 text-white rounded-lg border border-white/40 shrink-0">
+              S
+            </kbd>
           </button>
 
-          {/* Action 2: SCAN SCENE NOW (Immediate On-Demand Query) */}
+          {/* Action 2: DIRECT VOICE INPUT TRIGGER (Prominent Audio Accessibility) */}
+          <button
+            onClick={() => toggleVoiceRef.current?.()}
+            aria-label={
+              isVoiceListening
+                ? 'Microphone listening. Tap or press Spacebar to send question'
+                : 'Ask a question with your voice. Shortcut Spacebar'
+            }
+            aria-pressed={isVoiceListening}
+            className={`min-h-[84px] px-5 py-4 rounded-2xl font-black flex items-center justify-between gap-3 text-lg md:text-xl transition-all shadow-2xl border-4 active:scale-[0.98] cursor-pointer ${
+              isVoiceListening
+                ? 'bg-red-600 hover:bg-red-700 text-white border-white ring-4 ring-red-500/50 animate-pulse'
+                : 'bg-amber-400 hover:bg-amber-300 text-black border-white'
+            }`}
+          >
+            <div className="flex items-center gap-3">
+              {isVoiceListening ? (
+                <MicOff className="w-8 h-8 shrink-0 animate-bounce stroke-[2.5]" />
+              ) : (
+                <Mic className="w-8 h-8 shrink-0 stroke-[2.5]" />
+              )}
+              <span className="text-left leading-tight">
+                {isVoiceListening ? 'LISTENING... (TAP)' : 'SPEAK QUESTION'}
+              </span>
+            </div>
+            <kbd className="px-2.5 py-1 text-xs font-mono font-black bg-black text-yellow-300 rounded-lg border border-yellow-300 shrink-0">
+              SPACE
+            </kbd>
+          </button>
+
+          {/* Action 3: SCAN SCENE IMMEDIATELY */}
           <button
             onClick={() => performScan(true)}
             disabled={isScanning}
-            aria-label="Scan current scene immediately"
-            className="min-h-[68px] px-6 py-4 bg-slate-800 hover:bg-slate-700 active:scale-[0.98] text-white rounded-2xl font-bold flex items-center justify-center gap-3 text-base md:text-lg transition-all border border-slate-700 disabled:opacity-50"
+            aria-label="Scan current camera scene immediately. Shortcut Enter"
+            className="min-h-[84px] px-5 py-4 bg-slate-900 hover:bg-slate-800 active:scale-[0.98] text-white rounded-2xl font-black flex items-center justify-between gap-3 text-lg md:text-xl transition-all border-4 border-amber-400 disabled:opacity-50 cursor-pointer"
           >
-            <Scan className={`w-6 h-6 text-amber-400 ${isScanning ? 'animate-spin' : ''}`} />
-            <span>{isScanning ? 'ANALYZING...' : 'SCAN SCENE NOW'}</span>
+            <div className="flex items-center gap-3">
+              <Scan className={`w-8 h-8 text-amber-400 shrink-0 stroke-[2.5] ${isScanning ? 'animate-spin' : ''}`} />
+              <span className="text-left leading-tight">
+                {isScanning ? 'ANALYZING...' : 'SCAN SCENE NOW'}
+              </span>
+            </div>
+            <kbd className="px-2.5 py-1 text-xs font-mono font-black bg-black text-amber-300 rounded-lg border border-amber-400 shrink-0">
+              ENTER
+            </kbd>
           </button>
 
-          {/* Action 3: AUDIO MUTE / REPLAY */}
-          <div className="flex items-center gap-2">
+          {/* Action 4: AUDIO MUTE / REPEAT */}
+          <div className="flex items-stretch gap-2.5">
             <button
               onClick={() => {
                 const next = !isMuted;
                 setIsMuted(next);
                 if (next) speechManager.stop();
               }}
-              aria-label={isMuted ? 'Unmute spoken guidance' : 'Mute spoken guidance'}
-              className={`flex-1 min-h-[68px] px-4 py-4 rounded-2xl font-bold flex items-center justify-center gap-2.5 text-sm transition-all border ${
+              aria-label={isMuted ? 'Unmute spoken guidance. Shortcut M' : 'Mute spoken guidance. Shortcut M'}
+              aria-pressed={isMuted}
+              className={`flex-1 min-h-[84px] px-4 py-4 rounded-2xl font-black flex items-center justify-between gap-2 text-base md:text-lg transition-all border-4 cursor-pointer ${
                 isMuted
-                  ? 'bg-red-950/60 border-red-500 text-red-300'
-                  : 'bg-slate-900 border-slate-800 text-slate-200 hover:bg-slate-800'
+                  ? 'bg-red-950 border-red-500 text-red-200'
+                  : 'bg-slate-900 border-slate-600 text-white hover:border-amber-400'
               }`}
             >
-              {isMuted ? <VolumeX className="w-5 h-5 text-red-400" /> : <Volume2 className="w-5 h-5 text-amber-400" />}
-              <span>{isMuted ? 'UNMUTE AUDIO' : 'AUDIO ACTIVE'}</span>
+              <div className="flex items-center gap-2.5">
+                {isMuted ? (
+                  <VolumeX className="w-7 h-7 text-red-400 shrink-0" />
+                ) : (
+                  <Volume2 className="w-7 h-7 text-emerald-400 shrink-0" />
+                )}
+                <span className="leading-tight text-left">
+                  {isMuted ? 'AUDIO MUTED' : 'AUDIO ON'}
+                </span>
+              </div>
+              <kbd className="px-2 py-0.5 text-xs font-mono font-black bg-black text-slate-200 rounded border border-slate-600">
+                M
+              </kbd>
             </button>
 
-            {currentAnalysis && (
+            {lastSpokenText && (
               <button
-                onClick={() =>
-                  speechManager.speak(
-                    currentAnalysis.immediateAlert || currentAnalysis.spokenGuidance,
-                    { interrupt: true }
-                  )
-                }
-                aria-label="Replay current navigation instruction"
-                className="min-h-[68px] px-4 py-4 bg-slate-900 hover:bg-slate-800 border border-slate-800 rounded-2xl text-amber-400 font-bold text-xs flex flex-col items-center justify-center gap-1 transition-all"
+                onClick={() => speechManager.speak(lastSpokenText, { interrupt: true })}
+                aria-label="Replay last spoken instruction"
+                className="min-h-[84px] px-4 py-4 bg-amber-400 hover:bg-amber-300 border-4 border-white rounded-2xl text-black font-black text-xs md:text-sm flex flex-col items-center justify-center gap-1 transition-all shrink-0 cursor-pointer"
               >
-                <Volume2 className="w-4 h-4" />
+                <Volume2 className="w-6 h-6 stroke-[2.5]" />
                 <span>REPEAT</span>
               </button>
             )}
           </div>
         </section>
 
-        {/* 2-Column Responsive Layout: Camera Feed & Real-Time Navigation Guidance */}
+        {/* Main Workspace Grid: Prominent Camera Display + Accessible Audio Input & Guidance */}
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-          {/* Left Column: Live Smart Glasses Feed (7 cols) */}
-          <div id="feed" className="lg:col-span-7 space-y-4">
+          {/* Prominent Camera Display Column (8 cols default, 12 cols when expanded) */}
+          <div
+            id="feed"
+            className={`${isCameraExpanded ? 'lg:col-span-12' : 'lg:col-span-8'} space-y-6`}
+          >
             <CameraView
               sourceType={cameraSource}
               onSourceChange={setCameraSource}
@@ -394,20 +552,33 @@ export default function App() {
               ariaConfig={ariaConfig}
               onAriaConfigChange={setAriaConfig}
               onOpenAriaSetup={() => setIsAriaModalOpen(true)}
+              isExpanded={isCameraExpanded}
+              onToggleExpand={() => setIsCameraExpanded((prev) => !prev)}
+              onTriggerScan={() => performScan(true)}
+              isScanning={isScanning}
+              onTriggerVoice={() => toggleVoiceRef.current?.()}
+              isListening={isVoiceListening}
             />
 
-            {/* Voice Assistant Q&A Panel */}
+            {/* Accessible Audio Input & Voice Assistant Panel */}
             <div id="voice-qa">
               <VoiceAssistant
                 getFrame={() => (captureFrameRef.current ? captureFrameRef.current() : null)}
-                onAnswerReceived={(ans) => (lastSpokenTextRef.current = ans)}
+                onAnswerReceived={rememberSpoken}
                 onBusyChange={handleVoiceBusyChange}
+                onListeningStateChange={setIsVoiceListening}
+                registerToggleListening={handleRegisterToggleVoice}
+                registerAskQuestion={handleRegisterAskQuestion}
+                onVoiceCommand={handleVoiceCommand}
               />
             </div>
           </div>
 
-          {/* Right Column: Spoken Navigation Display & Log (5 cols) */}
-          <div id="guidance" className="lg:col-span-5 space-y-6">
+          {/* Right Column: Spoken Navigation Guidance & History Log */}
+          <div
+            id="guidance"
+            className={`${isCameraExpanded ? 'lg:col-span-12' : 'lg:col-span-4'} space-y-6`}
+          >
             <NavigationDisplay
               analysis={currentAnalysis}
               isAnalyzing={isScanning}
@@ -421,7 +592,7 @@ export default function App() {
           </div>
         </div>
 
-        {/* Accessibility & Voice Settings Bar */}
+        {/* Low-Vision & Audio Settings Bar */}
         <section id="controls">
           <AccessibilityControls
             voiceSettings={voiceSettings}
@@ -434,7 +605,39 @@ export default function App() {
             onTextSizeChange={setTextSize}
           />
         </section>
+
+        {/* Compact High-Contrast Safety Notice */}
+        <SafetyDisclaimer />
       </main>
+
+      {/* Persistent Floating Quick-Voice Button (Always reachable from anywhere on screen) */}
+      <div className="fixed bottom-5 right-5 z-40">
+        <button
+          onClick={() => toggleVoiceRef.current?.()}
+          aria-label={
+            isVoiceListening
+              ? 'Stop voice listening and send question'
+              : 'Quick Voice Input: Tap or press Spacebar to ask a question'
+          }
+          className={`min-h-[68px] px-6 py-4 rounded-full font-black text-base md:text-lg flex items-center gap-3 shadow-2xl border-4 transition-all active:scale-95 cursor-pointer ${
+            isVoiceListening
+              ? 'bg-red-600 text-white border-white ring-8 ring-red-500/40 animate-pulse'
+              : 'bg-amber-400 hover:bg-amber-300 text-black border-white shadow-amber-400/30'
+          }`}
+        >
+          {isVoiceListening ? (
+            <>
+              <MicOff className="w-7 h-7 animate-bounce stroke-[2.5]" />
+              <span>LISTENING... (TAP TO SEND)</span>
+            </>
+          ) : (
+            <>
+              <Mic className="w-7 h-7 stroke-[2.5]" />
+              <span>ASK VOICE [SPACE]</span>
+            </>
+          )}
+        </button>
+      </div>
 
       {/* Meta Project Aria Setup & Streaming Modal */}
       <AriaSetupModal

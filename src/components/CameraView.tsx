@@ -1,7 +1,30 @@
 import React, { useRef, useEffect, useState, useCallback } from 'react';
-import { Camera, RefreshCw, Glasses, Video, AlertCircle, Eye, Radio } from 'lucide-react';
-import { CameraSourceType, AriaConnectionConfig, NavigationAnalysis } from '../types/aria';
+import {
+  Camera,
+  RefreshCw,
+  Glasses,
+  AlertCircle,
+  Eye,
+  Radio,
+  ZoomIn,
+  Contrast,
+  Maximize2,
+  Minimize2,
+  Scan,
+  Mic,
+  ArrowUp,
+  ArrowUpLeft,
+  ArrowUpRight,
+  Octagon,
+  CornerUpLeft,
+  CornerUpRight,
+  Compass,
+} from 'lucide-react';
+import { CameraSourceType, AriaConnectionConfig, NavigationAnalysis, SpatialDirection } from '../types/aria';
 import { SIMULATION_SCENARIOS, drawAriaGlassesHUD } from '../utils/ariaSimulations';
+import { speechManager } from '../utils/speech';
+
+export type VisionFilterMode = 'standard' | 'high-contrast' | 'bright-boost' | 'mono-edge';
 
 interface CameraViewProps {
   sourceType: CameraSourceType;
@@ -11,6 +34,12 @@ interface CameraViewProps {
   ariaConfig: AriaConnectionConfig;
   onAriaConfigChange: (config: AriaConnectionConfig) => void;
   onOpenAriaSetup: () => void;
+  isExpanded?: boolean;
+  onToggleExpand?: () => void;
+  onTriggerScan?: () => void;
+  isScanning?: boolean;
+  onTriggerVoice?: () => void;
+  isListening?: boolean;
 }
 
 export const CameraView: React.FC<CameraViewProps> = ({
@@ -21,6 +50,12 @@ export const CameraView: React.FC<CameraViewProps> = ({
   ariaConfig,
   onAriaConfigChange,
   onOpenAriaSetup,
+  isExpanded = false,
+  onToggleExpand,
+  onTriggerScan,
+  isScanning = false,
+  onTriggerVoice,
+  isListening = false,
 }) => {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -32,6 +67,10 @@ export const CameraView: React.FC<CameraViewProps> = ({
   const [selectedScenarioIndex, setSelectedScenarioIndex] = useState<number>(0);
   const [isAriaConnecting, setIsAriaConnecting] = useState<boolean>(false);
   const [ariaLastFrameTime, setAriaLastFrameTime] = useState<number>(0);
+
+  // Low-Vision Accessibility Controls for Camera Viewfinder
+  const [zoomLevel, setZoomLevel] = useState<number>(1);
+  const [visionFilter, setVisionFilter] = useState<VisionFilterMode>('standard');
 
   // Capture frame function passed to parent
   const captureCurrentFrame = useCallback((): string | null => {
@@ -99,35 +138,24 @@ export const CameraView: React.FC<CameraViewProps> = ({
 
     async function initCamera() {
       try {
-        const constraints: MediaStreamConstraints = {
+        currentStream = await navigator.mediaDevices.getUserMedia({
           video: {
             facingMode: activeFacingMode,
             width: { ideal: 1280 },
             height: { ideal: 720 },
           },
           audio: false,
-        };
+        });
 
-        const stream = await navigator.mediaDevices.getUserMedia(constraints);
-        currentStream = stream;
         if (videoRef.current) {
-          videoRef.current.srcObject = stream;
-          await videoRef.current.play().catch(() => {});
+          videoRef.current.srcObject = currentStream;
+          await videoRef.current.play();
         }
       } catch (err: any) {
-        console.warn('Unable to access primary camera, trying fallback:', err);
-        try {
-          const fallbackStream = await navigator.mediaDevices.getUserMedia({ video: true });
-          currentStream = fallbackStream;
-          if (videoRef.current) {
-            videoRef.current.srcObject = fallbackStream;
-            await videoRef.current.play().catch(() => {});
-          }
-        } catch (fallbackErr: any) {
-          setCameraError(
-            'Camera permission denied or camera not found. You can switch to Aria Simulation mode for testing.'
-          );
-        }
+        console.warn('Camera access failed:', err);
+        setCameraError(
+          'Could not access webcam or phone camera. Please grant camera permissions or use Field Scenarios mode.'
+        );
       }
     }
 
@@ -135,12 +163,12 @@ export const CameraView: React.FC<CameraViewProps> = ({
 
     return () => {
       if (currentStream) {
-        currentStream.getTracks().forEach((track) => track.stop());
+        currentStream.getTracks().forEach((t) => t.stop());
       }
     };
   }, [sourceType, activeFacingMode]);
 
-  // Connect to Meta Project Aria WebSocket Stream if configured
+  // Connect to Meta Project Aria WebSocket / MJPEG Stream
   useEffect(() => {
     if (sourceType !== 'aria_stream') {
       if (ariaWsRef.current) {
@@ -150,68 +178,72 @@ export const CameraView: React.FC<CameraViewProps> = ({
       return;
     }
 
-    if (!ariaConfig.streamUrl) return;
+    const url = ariaConfig.streamUrl.trim();
+    if (!url.startsWith('ws://') && !url.startsWith('wss://')) {
+      return;
+    }
 
     setIsAriaConnecting(true);
-    let ws: WebSocket;
-    try {
-      ws = new WebSocket(ariaConfig.streamUrl);
-      ariaWsRef.current = ws;
+    let ws: WebSocket | null = null;
 
-      ws.binaryType = 'arraybuffer';
+    try {
+      ws = new WebSocket(url);
+      ariaWsRef.current = ws;
 
       ws.onopen = () => {
         setIsAriaConnecting(false);
         onAriaConfigChange({
           ...ariaConfig,
           connected: true,
-          fps: 30,
         });
       };
 
       ws.onmessage = (event) => {
-        setAriaLastFrameTime(Date.now());
-        // If image data received
-        const canvas = canvasRef.current;
-        if (!canvas) return;
-        const ctx = canvas.getContext('2d');
-        if (!ctx) return;
+        const now = performance.now();
+        const dt = ariaLastFrameTime ? now - ariaLastFrameTime : 33;
+        setAriaLastFrameTime(now);
+        const currentFps = Math.min(60, Math.round(1000 / Math.max(dt, 16)));
 
-        if (typeof event.data === 'string' && event.data.startsWith('data:image')) {
-          const img = new Image();
-          img.onload = () => {
-            canvas.width = img.width;
-            canvas.height = img.height;
-            ctx.drawImage(img, 0, 0);
-          };
-          img.src = event.data;
-        } else if (event.data instanceof ArrayBuffer || event.data instanceof Blob) {
-          const blob = new Blob([event.data], { type: 'image/jpeg' });
-          const url = URL.createObjectURL(blob);
-          const img = new Image();
-          img.onload = () => {
-            canvas.width = img.width;
-            canvas.height = img.height;
-            ctx.drawImage(img, 0, 0);
-            URL.revokeObjectURL(url);
-          };
-          img.src = url;
+        const img = new Image();
+        img.onload = () => {
+          if (canvasRef.current) {
+            const c = canvasRef.current;
+            c.width = img.width || 1408;
+            c.height = img.height || 1408;
+            const ctx = c.getContext('2d');
+            if (ctx) {
+              ctx.drawImage(img, 0, 0);
+              drawAriaGlassesHUD(ctx, c.width, c.height, `${currentFps} FPS Live`);
+            }
+          }
+        };
+
+        if (typeof event.data === 'string') {
+          img.src = event.data.startsWith('data:image')
+            ? event.data
+            : `data:image/jpeg;base64,${event.data}`;
+        } else if (event.data instanceof Blob) {
+          img.src = URL.createObjectURL(event.data);
         }
       };
 
-      ws.onerror = (e) => {
-        console.warn('Aria WebSocket stream error:', e);
+      ws.onerror = () => {
         setIsAriaConnecting(false);
-        onAriaConfigChange({ ...ariaConfig, connected: false });
+        onAriaConfigChange({
+          ...ariaConfig,
+          connected: false,
+        });
       };
 
       ws.onclose = () => {
         setIsAriaConnecting(false);
-        onAriaConfigChange({ ...ariaConfig, connected: false });
+        onAriaConfigChange({
+          ...ariaConfig,
+          connected: false,
+        });
       };
-    } catch (err) {
+    } catch (e) {
       setIsAriaConnecting(false);
-      onAriaConfigChange({ ...ariaConfig, connected: false });
     }
 
     return () => {
@@ -219,115 +251,247 @@ export const CameraView: React.FC<CameraViewProps> = ({
     };
   }, [sourceType, ariaConfig.streamUrl]);
 
-  // Simulation Render Loop
+  // Render Simulated Aria Smart Glasses Environment
   useEffect(() => {
     if (sourceType !== 'simulation') return;
+    const canvas = simCanvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
 
-    let animId: number;
-    let frame = 0;
-
-    const render = () => {
-      const canvas = simCanvasRef.current;
-      if (canvas) {
-        const ctx = canvas.getContext('2d');
-        if (ctx) {
-          const scenario = SIMULATION_SCENARIOS[selectedScenarioIndex];
-          if (scenario) {
-            scenario.draw(ctx, canvas.width, canvas.height, frame);
-            drawAriaGlassesHUD(ctx, canvas.width, canvas.height, scenario.name);
-          }
-        }
-      }
-      frame++;
-      animId = requestAnimationFrame(render);
-    };
-
-    render();
-
-    return () => {
-      cancelAnimationFrame(animId);
-    };
+    const scenario = SIMULATION_SCENARIOS[selectedScenarioIndex] || SIMULATION_SCENARIOS[0];
+    scenario.draw(ctx, canvas.width, canvas.height, 0);
+    drawAriaGlassesHUD(ctx, canvas.width, canvas.height, scenario.name);
   }, [sourceType, selectedScenarioIndex]);
 
+  // Optical filter CSS classes for low-vision accessibility
+  const getFilterStyle = (): React.CSSProperties => {
+    let filterStr = '';
+    switch (visionFilter) {
+      case 'high-contrast':
+        filterStr = 'contrast(1.75) saturate(1.4) brightness(1.1)';
+        break;
+      case 'bright-boost':
+        filterStr = 'brightness(1.45) contrast(1.35)';
+        break;
+      case 'mono-edge':
+        filterStr = 'grayscale(1) contrast(2.3) brightness(1.15)';
+        break;
+      case 'standard':
+      default:
+        filterStr = 'none';
+        break;
+    }
+    return {
+      filter: filterStr,
+      transform: `scale(${zoomLevel})`,
+      transformOrigin: 'center center',
+      transition: 'transform 0.2s ease-out, filter 0.2s ease-out',
+    };
+  };
+
+  // Dynamic perimeter frame border based on navigation urgency
+  const getViewportBorderClass = () => {
+    if (!analysis) return 'border-4 border-amber-400';
+    switch (analysis.urgency) {
+      case 'immediate_hazard':
+        return 'border-4 border-red-500 ring-4 ring-red-500/50';
+      case 'caution':
+        return 'border-4 border-amber-400 ring-2 ring-amber-400/30';
+      case 'clear':
+        return 'border-4 border-emerald-400';
+      default:
+        return 'border-4 border-sky-400';
+    }
+  };
+
+  const getDirectionHUDIcon = (dir: SpatialDirection) => {
+    switch (dir) {
+      case 'straight':
+        return <ArrowUp className="w-8 h-8 md:w-10 md:h-10 text-emerald-300 stroke-[3]" aria-hidden="true" />;
+      case 'slight_left':
+        return <ArrowUpLeft className="w-8 h-8 md:w-10 md:h-10 text-yellow-300 stroke-[3]" aria-hidden="true" />;
+      case 'slight_right':
+        return <ArrowUpRight className="w-8 h-8 md:w-10 md:h-10 text-yellow-300 stroke-[3]" aria-hidden="true" />;
+      case 'stop':
+        return <Octagon className="w-8 h-8 md:w-10 md:h-10 text-red-400 fill-red-500/30 stroke-[3]" aria-hidden="true" />;
+      case 'detour_left':
+        return <CornerUpLeft className="w-8 h-8 md:w-10 md:h-10 text-yellow-300 stroke-[3]" aria-hidden="true" />;
+      case 'detour_right':
+        return <CornerUpRight className="w-8 h-8 md:w-10 md:h-10 text-yellow-300 stroke-[3]" aria-hidden="true" />;
+      default:
+        return <Compass className="w-8 h-8 md:w-10 md:h-10 text-yellow-300 stroke-[3]" aria-hidden="true" />;
+    }
+  };
+
+  const cycleZoom = () => {
+    const nextZoom = zoomLevel === 1 ? 1.5 : zoomLevel === 1.5 ? 2 : 1;
+    setZoomLevel(nextZoom);
+    speechManager.speak(`Camera zoom ${nextZoom}x`);
+  };
+
+  const cycleFilter = () => {
+    const modes: { id: VisionFilterMode; label: string }[] = [
+      { id: 'standard', label: 'Standard View' },
+      { id: 'high-contrast', label: 'High Contrast View' },
+      { id: 'bright-boost', label: 'Bright Boost View' },
+      { id: 'mono-edge', label: 'Monochrome High Contrast' },
+    ];
+    const currentIndex = modes.findIndex((m) => m.id === visionFilter);
+    const next = modes[(currentIndex + 1) % modes.length];
+    setVisionFilter(next.id);
+    speechManager.speak(next.label);
+  };
+
   return (
-    <div className="flex flex-col bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden shadow-2xl">
-      {/* Top Source Switcher & Connection Bar */}
-      <div className="flex flex-wrap items-center justify-between gap-3 px-4 py-3 bg-slate-950/80 border-b border-slate-800">
-        <div className="flex items-center gap-2">
-          <span className="text-xs font-semibold text-slate-400 uppercase tracking-wider">Feed Source:</span>
-          {/* Segmented Source Controls */}
-          <div className="inline-flex items-center p-1 bg-slate-900 border border-slate-800 rounded-xl" role="tablist">
+    <section
+      aria-label="Live Camera Viewfinder and Low-Vision Controls"
+      className="flex flex-col bg-slate-950 border-2 border-slate-700 rounded-3xl overflow-hidden shadow-2xl"
+    >
+      {/* Top Header & Prominent Source Switcher */}
+      <div className="flex flex-col gap-3 p-4 md:p-5 bg-black border-b-2 border-slate-800">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-center gap-3">
+            <span className="flex h-4 w-4 relative" aria-hidden="true">
+              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-amber-400 opacity-75"></span>
+              <span className="relative inline-flex rounded-full h-4 w-4 bg-amber-400"></span>
+            </span>
+            <h2 className="text-lg md:text-xl font-black text-white uppercase tracking-wide">
+              Live Camera Display
+            </h2>
+          </div>
+
+          {/* Low-Vision Optical Enhancement Toolbar */}
+          <div className="flex flex-wrap items-center gap-2">
+            {/* Zoom Button */}
             <button
-              role="tab"
-              aria-selected={sourceType === 'aria_stream'}
-              onClick={() => onSourceChange('aria_stream')}
-              className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg transition-colors min-h-[36px] ${
-                sourceType === 'aria_stream'
-                  ? 'bg-amber-400 text-slate-950 shadow-sm'
-                  : 'text-slate-300 hover:text-white'
+              onClick={cycleZoom}
+              aria-label={`Magnify camera feed. Current zoom ${zoomLevel}x`}
+              className={`flex items-center gap-2 px-3.5 py-2 rounded-xl text-sm font-extrabold border-2 transition-all min-h-[46px] ${
+                zoomLevel > 1
+                  ? 'bg-yellow-300 text-black border-yellow-200'
+                  : 'bg-slate-900 text-white border-slate-600 hover:border-yellow-300'
               }`}
             >
-              <Glasses className="w-3.5 h-3.5" aria-hidden="true" />
-              <span>Project Aria Glasses</span>
+              <ZoomIn className="w-5 h-5 shrink-0" />
+              <span>ZOOM: {zoomLevel}x</span>
             </button>
 
+            {/* High-Contrast Filter Button */}
             <button
-              role="tab"
-              aria-selected={sourceType === 'webcam'}
-              onClick={() => onSourceChange('webcam')}
-              className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg transition-colors min-h-[36px] ${
-                sourceType === 'webcam'
-                  ? 'bg-amber-400 text-slate-950 shadow-sm'
-                  : 'text-slate-300 hover:text-white'
+              onClick={cycleFilter}
+              aria-label={`Change camera visual contrast filter. Current filter ${visionFilter}`}
+              className={`flex items-center gap-2 px-3.5 py-2 rounded-xl text-sm font-extrabold border-2 transition-all min-h-[46px] ${
+                visionFilter !== 'standard'
+                  ? 'bg-yellow-300 text-black border-yellow-200'
+                  : 'bg-slate-900 text-white border-slate-600 hover:border-yellow-300'
               }`}
             >
-              <Camera className="w-3.5 h-3.5" aria-hidden="true" />
-              <span>Webcam / Mobile</span>
+              <Contrast className="w-5 h-5 shrink-0" />
+              <span className="capitalize">
+                {visionFilter === 'standard' ? 'Contrast Boost' : visionFilter.replace('-', ' ')}
+              </span>
             </button>
 
-            <button
-              role="tab"
-              aria-selected={sourceType === 'simulation'}
-              onClick={() => onSourceChange('simulation')}
-              className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg transition-colors min-h-[36px] ${
-                sourceType === 'simulation'
-                  ? 'bg-amber-400 text-slate-950 shadow-sm'
-                  : 'text-slate-300 hover:text-white'
-              }`}
-            >
-              <Eye className="w-3.5 h-3.5" aria-hidden="true" />
-              <span>Field Scenarios</span>
-            </button>
+            {/* Flip Camera (Webcam mode) */}
+            {sourceType === 'webcam' && (
+              <button
+                onClick={() =>
+                  setActiveFacingMode((prev) => (prev === 'environment' ? 'user' : 'environment'))
+                }
+                aria-label="Switch between front and rear camera"
+                className="flex items-center gap-2 px-3.5 py-2 text-sm font-extrabold bg-slate-900 hover:bg-slate-800 text-white rounded-xl transition-colors border-2 border-slate-600 hover:border-yellow-300 min-h-[46px]"
+              >
+                <RefreshCw className="w-5 h-5 text-yellow-300" />
+                <span>Flip ({activeFacingMode === 'environment' ? 'Rear' : 'Front'})</span>
+              </button>
+            )}
+
+            {/* Expand / Full-Width Toggle */}
+            {onToggleExpand && (
+              <button
+                onClick={onToggleExpand}
+                aria-label={isExpanded ? 'Restore standard camera size' : 'Expand camera to full screen width'}
+                className={`flex items-center gap-2 px-3.5 py-2 rounded-xl text-sm font-extrabold border-2 transition-all min-h-[46px] ${
+                  isExpanded
+                    ? 'bg-amber-400 text-black border-amber-300'
+                    : 'bg-slate-900 text-white border-slate-600 hover:border-yellow-300'
+                }`}
+              >
+                {isExpanded ? <Minimize2 className="w-5 h-5" /> : <Maximize2 className="w-5 h-5" />}
+                <span>{isExpanded ? 'Standard Size' : 'Expand Camera'}</span>
+              </button>
+            )}
           </div>
         </div>
 
-        {/* Action button: Aria Setup Guide or Camera Toggle */}
-        <div className="flex items-center gap-2">
-          {sourceType === 'aria_stream' && (
-            <button
-              onClick={onOpenAriaSetup}
-              className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg transition-colors border border-slate-700 min-h-[36px]"
-            >
-              <Radio className="w-3.5 h-3.5 text-amber-400" />
-              <span>Glasses Bridge Setup</span>
-            </button>
-          )}
+        {/* High-Visibility Segmented Source Controls */}
+        <div
+          className="grid grid-cols-1 sm:grid-cols-3 gap-2.5 pt-1"
+          role="tablist"
+          aria-label="Camera Feed Source Selection"
+        >
+          <button
+            role="tab"
+            aria-selected={sourceType === 'webcam'}
+            onClick={() => {
+              onSourceChange('webcam');
+              speechManager.speak('Webcam and mobile camera active');
+            }}
+            className={`flex items-center justify-center gap-2.5 px-4 py-3 text-sm md:text-base font-extrabold rounded-2xl transition-all min-h-[54px] border-2 ${
+              sourceType === 'webcam'
+                ? 'bg-amber-400 text-black border-white shadow-lg'
+                : 'bg-slate-900 text-white border-slate-700 hover:border-amber-400'
+            }`}
+          >
+            <Camera className="w-5 h-5 shrink-0" aria-hidden="true" />
+            <span>1. Live Webcam / Phone</span>
+          </button>
 
-          {sourceType === 'webcam' && (
-            <button
-              onClick={() => setActiveFacingMode((prev) => (prev === 'environment' ? 'user' : 'environment'))}
-              aria-label="Switch between front and back camera"
-              className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg transition-colors border border-slate-700 min-h-[36px]"
-            >
-              <RefreshCw className="w-3.5 h-3.5" />
-              <span>Flip ({activeFacingMode === 'environment' ? 'Rear' : 'Front'})</span>
-            </button>
-          )}
+          <button
+            role="tab"
+            aria-selected={sourceType === 'simulation'}
+            onClick={() => {
+              onSourceChange('simulation');
+              speechManager.speak('Field scenarios simulation active');
+            }}
+            className={`flex items-center justify-center gap-2.5 px-4 py-3 text-sm md:text-base font-extrabold rounded-2xl transition-all min-h-[54px] border-2 ${
+              sourceType === 'simulation'
+                ? 'bg-amber-400 text-black border-white shadow-lg'
+                : 'bg-slate-900 text-white border-slate-700 hover:border-amber-400'
+            }`}
+          >
+            <Eye className="w-5 h-5 shrink-0" aria-hidden="true" />
+            <span>2. Field Scenarios</span>
+          </button>
+
+          <button
+            role="tab"
+            aria-selected={sourceType === 'aria_stream'}
+            onClick={() => {
+              onSourceChange('aria_stream');
+              speechManager.speak('Meta Project Aria smart glasses stream selected');
+            }}
+            className={`flex items-center justify-center gap-2.5 px-4 py-3 text-sm md:text-base font-extrabold rounded-2xl transition-all min-h-[54px] border-2 ${
+              sourceType === 'aria_stream'
+                ? 'bg-amber-400 text-black border-white shadow-lg'
+                : 'bg-slate-900 text-white border-slate-700 hover:border-amber-400'
+            }`}
+          >
+            <Glasses className="w-5 h-5 shrink-0" aria-hidden="true" />
+            <span>3. Aria Smart Glasses</span>
+          </button>
         </div>
       </div>
 
-      {/* Main Viewport Container */}
-      <div className="relative w-full aspect-video md:aspect-[16/10] bg-black flex items-center justify-center overflow-hidden">
+      {/* Prominent Main Viewport Container */}
+      <div
+        className={`relative w-full bg-black flex items-center justify-center overflow-hidden transition-all ${
+          isExpanded
+            ? 'min-h-[480px] sm:min-h-[580px] md:min-h-[680px]'
+            : 'min-h-[380px] sm:min-h-[460px] md:min-h-[540px]'
+        } ${getViewportBorderClass()}`}
+      >
         {/* Source 1: Webcam Stream */}
         {sourceType === 'webcam' && (
           <>
@@ -336,16 +500,19 @@ export const CameraView: React.FC<CameraViewProps> = ({
               playsInline
               muted
               autoPlay
-              className="w-full h-full object-cover"
+              style={getFilterStyle()}
+              className="w-full h-full object-cover min-h-[380px] sm:min-h-[460px] md:min-h-[540px]"
               aria-label="Live camera feed"
             />
             {cameraError && (
-              <div className="absolute inset-0 bg-slate-950/90 flex flex-col items-center justify-center p-6 text-center">
-                <AlertCircle className="w-10 h-10 text-amber-400 mb-3" />
-                <p className="text-sm text-slate-200 font-medium max-w-md">{cameraError}</p>
+              <div className="absolute inset-0 bg-black/95 flex flex-col items-center justify-center p-6 text-center z-20">
+                <AlertCircle className="w-16 h-16 text-amber-400 mb-4" />
+                <p className="text-lg md:text-xl text-white font-extrabold max-w-lg leading-relaxed">
+                  {cameraError}
+                </p>
                 <button
                   onClick={() => onSourceChange('simulation')}
-                  className="mt-4 px-4 py-2 bg-amber-400 text-slate-950 font-bold rounded-xl text-sm"
+                  className="mt-6 px-6 py-4 bg-amber-400 hover:bg-amber-300 text-black font-black rounded-2xl text-base md:text-lg border-2 border-white shadow-xl"
                 >
                   Switch to Field Scenarios Demo
                 </button>
@@ -356,29 +523,38 @@ export const CameraView: React.FC<CameraViewProps> = ({
 
         {/* Source 2: Meta Project Aria Stream */}
         {sourceType === 'aria_stream' && (
-          <div className="relative w-full h-full flex flex-col items-center justify-center bg-slate-950">
-            <canvas ref={canvasRef} className="max-w-full max-h-full object-contain" />
+          <div className="relative w-full h-full min-h-[380px] sm:min-h-[460px] md:min-h-[540px] flex flex-col items-center justify-center bg-black">
+            <canvas
+              ref={canvasRef}
+              style={getFilterStyle()}
+              className="max-w-full max-h-full object-contain"
+            />
 
             {!ariaConfig.connected && (
-              <div className="absolute inset-0 bg-slate-950/85 backdrop-blur-xs flex flex-col items-center justify-center p-6 text-center">
-                <Glasses className="w-12 h-12 text-amber-400 mb-3" />
-                <h4 className="text-base font-bold text-white mb-1">Connecting to Meta Project Aria</h4>
-                <p className="text-xs text-slate-300 max-w-md mb-4">
-                  Waiting for stream at <span className="font-mono text-amber-300">{ariaConfig.streamUrl}</span>.
-                  Ensure Aria glasses are on Wi-Fi and the Python bridge is streaming.
+              <div className="absolute inset-0 bg-black/90 backdrop-blur-xs flex flex-col items-center justify-center p-6 text-center z-20">
+                <Glasses className="w-16 h-16 text-amber-400 mb-4" />
+                <h3 className="text-xl md:text-2xl font-black text-white mb-2">
+                  Connecting to Meta Project Aria Glasses
+                </h3>
+                <p className="text-base text-slate-200 max-w-lg mb-6 font-medium">
+                  Waiting for stream at{' '}
+                  <span className="font-mono font-bold text-yellow-300 underline">
+                    {ariaConfig.streamUrl}
+                  </span>
+                  . Ensure your Aria glasses are on Wi-Fi and the Python bridge is running.
                 </p>
-                <div className="flex gap-2">
+                <div className="flex flex-wrap justify-center gap-4">
                   <button
                     onClick={onOpenAriaSetup}
-                    className="px-4 py-2 bg-amber-400 hover:bg-amber-300 text-slate-950 font-bold text-xs rounded-xl shadow-md transition-colors"
+                    className="px-6 py-4 bg-amber-400 hover:bg-amber-300 text-black font-black text-base rounded-2xl border-2 border-white shadow-lg transition-colors"
                   >
-                    View Setup Instructions
+                    Open Glasses Bridge Setup
                   </button>
                   <button
                     onClick={() => onSourceChange('simulation')}
-                    className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 font-medium text-xs rounded-xl transition-colors border border-slate-700"
+                    className="px-6 py-4 bg-slate-900 hover:bg-slate-800 text-white font-extrabold text-base rounded-2xl transition-colors border-2 border-slate-600"
                   >
-                    Use Simulation Demo
+                    Use Field Scenarios Demo
                   </button>
                 </div>
               </div>
@@ -388,44 +564,102 @@ export const CameraView: React.FC<CameraViewProps> = ({
 
         {/* Source 3: Aria Simulation Rig */}
         {sourceType === 'simulation' && (
-          <div className="relative w-full h-full">
+          <div className="relative w-full h-full min-h-[380px] sm:min-h-[460px] md:min-h-[540px] flex items-center justify-center">
             <canvas
               ref={simCanvasRef}
               width={1408}
               height={1408}
-              className="w-full h-full object-cover"
+              style={getFilterStyle()}
+              className="w-full h-full max-h-[680px] object-cover"
               aria-label="Simulated Aria glasses camera view"
             />
           </div>
         )}
 
         {/* Hidden offscreen canvas for webcam capture */}
-        <canvas ref={canvasRef} className="hidden" />
+        {sourceType !== 'aria_stream' && <canvas ref={canvasRef} className="hidden" />}
 
-        {/* Visual Spatial Guidance Overlay (for sighted testers / mobility observers) */}
+        {/* Top-Left Optical Status Pill (Visible when Zoom or Filter is active) */}
+        {(zoomLevel > 1 || visionFilter !== 'standard') && (
+          <div className="absolute top-4 left-4 z-10 bg-black/90 text-yellow-300 border-2 border-yellow-400 px-4 py-2 rounded-xl text-sm font-black uppercase tracking-wider shadow-lg">
+            {zoomLevel > 1 && `Zoom ${zoomLevel}x`}
+            {zoomLevel > 1 && visionFilter !== 'standard' && ' • '}
+            {visionFilter !== 'standard' && visionFilter.replace('-', ' ')}
+          </div>
+        )}
+
+        {/* Top-Right Direct Camera Action Overlay Buttons (Quick Scan & Quick Voice) */}
+        <div className="absolute top-4 right-4 z-10 flex items-center gap-2.5">
+          {onTriggerScan && (
+            <button
+              onClick={onTriggerScan}
+              disabled={isScanning}
+              aria-label="Scan camera view right now"
+              className="px-4 py-2.5 bg-black/90 hover:bg-slate-900 text-white border-2 border-amber-400 rounded-xl font-black text-sm flex items-center gap-2 shadow-xl active:scale-95 disabled:opacity-60 min-h-[48px]"
+            >
+              <Scan className={`w-5 h-5 text-amber-400 ${isScanning ? 'animate-spin' : ''}`} />
+              <span>{isScanning ? 'SCANNING...' : 'SCAN VIEW'}</span>
+            </button>
+          )}
+          {onTriggerVoice && (
+            <button
+              onClick={onTriggerVoice}
+              aria-label={isListening ? 'Stop voice listening' : 'Speak a question about camera view'}
+              className={`px-4 py-2.5 rounded-xl font-black text-sm flex items-center gap-2 shadow-xl active:scale-95 border-2 min-h-[48px] ${
+                isListening
+                  ? 'bg-red-600 text-white border-white animate-pulse'
+                  : 'bg-amber-400 hover:bg-amber-300 text-black border-white'
+              }`}
+            >
+              <Mic className="w-5 h-5" />
+              <span>{isListening ? 'LISTENING...' : 'ASK VOICE'}</span>
+            </button>
+          )}
+        </div>
+
+        {/* High-Visibility Spatial Guidance & Closed-Caption Overlay on Camera */}
         {analysis && (
-          <div className="absolute bottom-4 left-4 right-4 pointer-events-none flex flex-col gap-2">
-            {/* Urgent hazard banner if active */}
+          <div className="absolute bottom-0 inset-x-0 p-4 bg-gradient-to-t from-black via-black/95 to-transparent flex flex-col gap-3 z-10">
+            {/* Urgent hazard alert banner */}
             {analysis.urgency === 'immediate_hazard' && (
-              <div className="bg-red-600/95 text-white font-bold px-4 py-2.5 rounded-xl border-2 border-red-300 flex items-center justify-between shadow-xl animate-pulse">
-                <div className="flex items-center gap-2">
-                  <AlertCircle className="w-5 h-5 shrink-0" />
-                  <span className="text-sm tracking-wide">
-                    {analysis.immediateAlert || 'HAZARD DETECTED: STOP OR HOLD POSITION'}
+              <div
+                role="alert"
+                className="bg-red-600 text-white font-black px-5 py-3.5 rounded-2xl border-4 border-white flex items-center justify-between shadow-2xl animate-pulse"
+              >
+                <div className="flex items-center gap-3">
+                  <AlertCircle className="w-8 h-8 shrink-0 stroke-[2.5]" />
+                  <span className="text-lg md:text-2xl tracking-wide uppercase">
+                    {analysis.immediateAlert || 'HAZARD AHEAD: STOP IMMEDIATELY'}
                   </span>
                 </div>
-                <span className="text-xs uppercase font-mono bg-red-950/80 px-2 py-0.5 rounded">STOP</span>
+                <span className="text-base md:text-lg uppercase font-mono bg-black text-yellow-300 px-3 py-1 rounded-lg border-2 border-yellow-300">
+                  STOP
+                </span>
               </div>
             )}
 
-            {/* Path arrow & detected objects pill bar */}
-            <div className="flex items-center justify-between bg-slate-950/85 backdrop-blur-md px-3 py-2 rounded-xl border border-slate-700 text-xs">
-              <div className="flex items-center gap-2 text-slate-200">
-                <span className="font-semibold text-amber-400 uppercase text-[11px]">Recommended Path:</span>
-                <span className="font-bold capitalize">{analysis.spatialDirection.replace('_', ' ')}</span>
+            {/* High-Contrast Closed Caption & Direction Bar */}
+            <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3 bg-black/95 px-5 py-4 rounded-2xl border-2 border-amber-400 shadow-2xl">
+              <div className="flex items-center gap-3.5">
+                <div className="p-2.5 bg-slate-900 border-2 border-slate-700 rounded-xl shrink-0">
+                  {getDirectionHUDIcon(analysis.spatialDirection)}
+                </div>
+                <div>
+                  <div className="flex items-center gap-2">
+                    <span className="font-extrabold text-amber-300 uppercase text-xs md:text-sm tracking-wider">
+                      PATH DIRECTION:
+                    </span>
+                    <span className="font-black text-white uppercase text-base md:text-xl bg-slate-900 px-2.5 py-0.5 rounded-lg border border-slate-700">
+                      {analysis.spatialDirection.replace('_', ' ')}
+                    </span>
+                  </div>
+                  <p className="text-base md:text-xl font-extrabold text-yellow-300 mt-1 leading-snug">
+                    "{analysis.spokenGuidance}"
+                  </p>
+                </div>
               </div>
 
-              <div className="text-[11px] text-slate-400 font-mono">
+              <div className="text-sm font-mono font-bold text-white bg-slate-900 px-3.5 py-2 rounded-xl border border-slate-700 shrink-0 self-start sm:self-center">
                 Objects: {analysis.detectedObjects?.length || 0}
               </div>
             </div>
@@ -433,35 +667,50 @@ export const CameraView: React.FC<CameraViewProps> = ({
         )}
       </div>
 
-      {/* Simulation Scenario Selector Strip */}
+      {/* Prominent Simulation Scenario Selector Strip */}
       {sourceType === 'simulation' && (
-        <div className="px-4 py-3 bg-slate-950 border-t border-slate-800">
-          <div className="flex items-center justify-between mb-2">
-            <span className="text-xs font-bold text-slate-300 uppercase tracking-wide">
-              Test Real-World Scenarios (Aria Glasses POV):
+        <div className="p-4 md:p-5 bg-black border-t-2 border-slate-800">
+          <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
+            <span className="text-sm md:text-base font-black text-white uppercase tracking-wide">
+              Select Simulated Scene (Aria Glasses POV):
             </span>
-            <span className="text-xs text-amber-400 font-semibold">
-              Scenario {selectedScenarioIndex + 1} of {SIMULATION_SCENARIOS.length}
+            <span className="text-sm font-extrabold text-black bg-amber-400 px-3 py-1 rounded-lg">
+              Scene {selectedScenarioIndex + 1} of {SIMULATION_SCENARIOS.length}
             </span>
           </div>
-          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-            {SIMULATION_SCENARIOS.map((scen, idx) => (
-              <button
-                key={scen.id}
-                onClick={() => setSelectedScenarioIndex(idx)}
-                className={`p-2.5 text-left rounded-xl transition-all border text-xs ${
-                  selectedScenarioIndex === idx
-                    ? 'bg-slate-800 border-amber-400 text-white font-bold ring-1 ring-amber-400'
-                    : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-slate-200 hover:bg-slate-850'
-                }`}
-              >
-                <div className="truncate font-semibold text-slate-100">{scen.name}</div>
-                <div className="text-[10px] text-amber-300/80 truncate mt-0.5">{scen.hazardType}</div>
-              </button>
-            ))}
+          <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-3">
+            {SIMULATION_SCENARIOS.map((scen, idx) => {
+              const isSelected = selectedScenarioIndex === idx;
+              return (
+                <button
+                  key={scen.id}
+                  onClick={() => {
+                    setSelectedScenarioIndex(idx);
+                    speechManager.speak(`Scenario ${idx + 1}: ${scen.name}`);
+                  }}
+                  aria-pressed={isSelected}
+                  className={`p-3.5 text-left rounded-2xl transition-all border-2 min-h-[72px] flex flex-col justify-between ${
+                    isSelected
+                      ? 'bg-amber-400 border-white text-black font-black shadow-lg scale-[1.01]'
+                      : 'bg-slate-900 border-slate-700 text-white hover:border-amber-400'
+                  }`}
+                >
+                  <div className="text-sm md:text-base font-extrabold leading-tight">
+                    {idx + 1}. {scen.name}
+                  </div>
+                  <div
+                    className={`text-xs font-bold mt-1.5 uppercase tracking-wide ${
+                      isSelected ? 'text-slate-950' : 'text-amber-300'
+                    }`}
+                  >
+                    {scen.hazardType}
+                  </div>
+                </button>
+              );
+            })}
           </div>
         </div>
       )}
-    </div>
+    </section>
   );
 };
