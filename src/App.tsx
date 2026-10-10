@@ -1,15 +1,46 @@
 /**
- * Aria Vision: Minimalist AI Vision & Voice Assistant for the Visually Impaired
+ * Aria Vision: Minimalist AI Vision & Voice Assistant with Spatial Object Memory
  * Pure Video Display + Single Prominent Voice Input Button (iPhone & Desktop Compatible)
  */
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { Mic, MicOff, Sparkles } from 'lucide-react';
-import { CameraSourceType, AriaConnectionConfig } from './types/aria';
+import {
+  CameraSourceType,
+  AriaConnectionConfig,
+  RememberedObject,
+  MemoryFrameSnapshot,
+} from './types/aria';
 import { CameraView } from './components/CameraView';
 import { soundEffects } from './utils/audio';
 import { speechManager } from './utils/speech';
-import { askNavigationQuestion } from './utils/geminiClient';
+import {
+  askNavigationQuestion,
+  memorizeFrameObjects,
+  FormattedPastFrame,
+  FormattedMemoryItem,
+} from './utils/geminiClient';
+
+const STORAGE_KEY = 'aria_spatial_object_memory_v1';
+const MAX_REMEMBERED_OBJECTS = 40;
+const MAX_PAST_FRAMES = 5;
+
+function computeRelativeDirectionHint(
+  pastHeading: number | null | undefined,
+  currentHeading: number | null | undefined
+): string | undefined {
+  if (pastHeading == null || currentHeading == null) return undefined;
+  // Signed angle from currentHeading to pastHeading in [-180, 180]
+  let delta = ((pastHeading - currentHeading + 540) % 360) - 180;
+  const absDelta = Math.round(Math.abs(delta));
+
+  if (absDelta < 20) return 'roughly in the direction you are currently facing';
+  if (absDelta > 150) return `behind you (about ${absDelta}° turn around)`;
+  if (delta < 0) {
+    return `to your left (turn about ${absDelta}° left)`;
+  }
+  return `to your right (turn about ${absDelta}° right)`;
+}
 
 export default function App() {
   const [cameraSource, setCameraSource] = useState<CameraSourceType>('webcam');
@@ -25,6 +56,17 @@ export default function App() {
   const [isProcessing, setIsProcessing] = useState<boolean>(false);
   const [transcript, setTranscript] = useState<string>('');
   const [spokenResponse, setSpokenResponse] = useState<string>('');
+  const [isRecalledFromMemory, setIsRecalledFromMemory] = useState<boolean>(false);
+  const [spatialMemory, setSpatialMemory] = useState<RememberedObject[]>(() => {
+    try {
+      const saved = localStorage.getItem(STORAGE_KEY);
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed)) return parsed;
+      }
+    } catch (_) {}
+    return [];
+  });
 
   const captureFrameRef = useRef<(() => string | null) | null>(null);
   const recognitionRef = useRef<any>(null);
@@ -34,38 +76,248 @@ export default function App() {
   const isListeningRef = useRef<boolean>(false);
   const isProcessingRef = useRef<boolean>(false);
 
+  // Spatial Memory & Orientation Refs
+  const spatialMemoryRef = useRef<RememberedObject[]>(spatialMemory);
+  const recentFramesRef = useRef<MemoryFrameSnapshot[]>([]);
+  const lastFingerprintRef = useRef<Uint8Array | null>(null);
+  const lastBackgroundMemorizeRef = useRef<number>(0);
+  const isMemorizingRef = useRef<boolean>(false);
+  const headingRef = useRef<number | null>(null);
+  const orientationPermissionRequestedRef = useRef<boolean>(false);
+
   useEffect(() => {
     isProcessingRef.current = isProcessing;
   }, [isProcessing]);
+
+  useEffect(() => {
+    spatialMemoryRef.current = spatialMemory;
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(spatialMemory));
+    } catch (_) {}
+  }, [spatialMemory]);
 
   const handleFrameCaptureReady = useCallback((captureFn: () => string | null) => {
     captureFrameRef.current = captureFn;
   }, []);
 
-  // Send captured voice question (or recorded audio) + video frame to Gemini Vision
+  // Merge newly observed objects into Spatial Memory
+  const mergeObservedObjects = useCallback(
+    (
+      newItems: { label: string; position: string; distance: string; landmarkContext: string }[],
+      observedHeading: number | null
+    ) => {
+      if (!Array.isArray(newItems) || newItems.length === 0) return;
+      const now = Date.now();
+
+      setSpatialMemory((prev) => {
+        const map = new Map<string, RememberedObject>();
+        for (const existing of prev) {
+          map.set(existing.label.trim().toLowerCase(), existing);
+        }
+
+        for (const item of newItems) {
+          if (!item?.label) continue;
+          const key = item.label.trim().toLowerCase();
+          map.set(key, {
+            label: item.label.trim(),
+            position: item.position || 'in view',
+            distance: item.distance || 'nearby',
+            landmarkContext: item.landmarkContext || 'in the room',
+            headingDeg: observedHeading,
+            timestamp: now,
+          });
+        }
+
+        return Array.from(map.values())
+          .sort((a, b) => b.timestamp - a.timestamp)
+          .slice(0, MAX_REMEMBERED_OBJECTS);
+      });
+    },
+    []
+  );
+
+  // Track device compass heading (DeviceOrientationEvent) for relative direction recall
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+
+    const handleOrientation = (e: any) => {
+      if (typeof e.webkitCompassHeading === 'number') {
+        headingRef.current = e.webkitCompassHeading;
+      } else if (typeof e.alpha === 'number') {
+        headingRef.current = (360 - e.alpha) % 360;
+      }
+    };
+
+    window.addEventListener('deviceorientation', handleOrientation, true);
+    return () => window.removeEventListener('deviceorientation', handleOrientation, true);
+  }, []);
+
+  // Compute a 16x16 grayscale fingerprint of a base64 image to detect when camera pans to a new view
+  const computeImageFingerprint = useCallback((dataUrl: string): Promise<Uint8Array | null> => {
+    return new Promise((resolve) => {
+      const img = new Image();
+      img.onload = () => {
+        const canvas = document.createElement('canvas');
+        canvas.width = 16;
+        canvas.height = 16;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) {
+          resolve(null);
+          return;
+        }
+        ctx.drawImage(img, 0, 0, 16, 16);
+        const pixels = ctx.getImageData(0, 0, 16, 16).data;
+        const gray = new Uint8Array(256);
+        for (let i = 0; i < 256; i++) {
+          const idx = i * 4;
+          gray[i] = Math.round(
+            0.299 * pixels[idx] + 0.587 * pixels[idx + 1] + 0.114 * pixels[idx + 2]
+          );
+        }
+        resolve(gray);
+      };
+      img.onerror = () => resolve(null);
+      img.src = dataUrl;
+    });
+  }, []);
+
+  // Continuous Background Scene-Change Watcher & Object Memory Indexer
+  useEffect(() => {
+    const interval = setInterval(async () => {
+      if (!captureFrameRef.current) return;
+      const frame = captureFrameRef.current();
+      if (!frame) return;
+
+      const fingerprint = await computeImageFingerprint(frame);
+      if (!fingerprint) return;
+
+      let diffScore = 999;
+      if (lastFingerprintRef.current) {
+        let totalDiff = 0;
+        for (let i = 0; i < 256; i++) {
+          totalDiff += Math.abs(fingerprint[i] - lastFingerprintRef.current[i]);
+        }
+        diffScore = totalDiff / 256;
+      }
+
+      // If camera moved to a noticeably different view (or first snapshot)
+      if (diffScore > 16) {
+        lastFingerprintRef.current = fingerprint;
+        const now = Date.now();
+        const snapshotHeading = headingRef.current;
+
+        recentFramesRef.current = [
+          { image: frame, timestamp: now, headingDeg: snapshotHeading },
+          ...recentFramesRef.current,
+        ].slice(0, MAX_PAST_FRAMES);
+
+        // Background object extraction every ~9s when viewing a new area
+        if (
+          !isProcessingRef.current &&
+          !isMemorizingRef.current &&
+          now - lastBackgroundMemorizeRef.current > 9000
+        ) {
+          isMemorizingRef.current = true;
+          lastBackgroundMemorizeRef.current = now;
+          memorizeFrameObjects(frame)
+            .then((objects) => {
+              mergeObservedObjects(objects, snapshotHeading);
+            })
+            .catch(() => {})
+            .finally(() => {
+              isMemorizingRef.current = false;
+            });
+        }
+      }
+    }, 2200);
+
+    return () => clearInterval(interval);
+  }, [computeImageFingerprint, mergeObservedObjects]);
+
+  // Send captured voice question (or recorded audio) + video frame + Spatial Memory to Gemini Vision
   const processVoiceQuery = useCallback(
     async (questionText: string, audioBase64?: string | null, audioMimeType?: string) => {
       if (isProcessingRef.current) return;
 
+      const trimmed = questionText.trim();
+      if (
+        trimmed.toLowerCase() === 'clear memory' ||
+        trimmed.toLowerCase() === 'reset memory' ||
+        trimmed.toLowerCase() === 'forget everything'
+      ) {
+        setSpatialMemory([]);
+        recentFramesRef.current = [];
+        const msg = 'Spatial object memory has been cleared.';
+        setSpokenResponse(msg);
+        setIsRecalledFromMemory(false);
+        speechManager.speak(msg, { isUrgent: true });
+        return;
+      }
+
       const query =
-        questionText.trim().length > 1
-          ? questionText.trim()
+        trimmed.length > 1
+          ? trimmed
           : 'What is directly in front of me and is the path safe to walk?';
 
       setIsProcessing(true);
       try {
+        const now = Date.now();
+        const currentHeading = headingRef.current;
         const frame = captureFrameRef.current ? captureFrameRef.current() : null;
-        const res = await askNavigationQuestion(frame, query, audioBase64, audioMimeType);
+
+        // Format past distinct frames (excluding ones captured < 1.5s ago)
+        const formattedPastFrames: FormattedPastFrame[] = recentFramesRef.current
+          .filter((f) => now - f.timestamp >= 1500)
+          .slice(0, 3)
+          .map((f) => ({
+            image: f.image,
+            secondsAgo: Math.max(1, Math.round((now - f.timestamp) / 1000)),
+            relativeDirectionHint: computeRelativeDirectionHint(f.headingDeg, currentHeading),
+          }));
+
+        // Format spatial object memory items
+        const formattedMemory: FormattedMemoryItem[] = spatialMemoryRef.current.map((m) => ({
+          label: m.label,
+          position: m.position,
+          distance: m.distance,
+          landmarkContext: m.landmarkContext,
+          secondsAgo: Math.max(1, Math.round((now - m.timestamp) / 1000)),
+          relativeDirectionHint: computeRelativeDirectionHint(m.headingDeg, currentHeading),
+        }));
+
+        const res = await askNavigationQuestion(
+          frame,
+          query,
+          audioBase64,
+          audioMimeType,
+          formattedPastFrames,
+          formattedMemory
+        );
+
+        // Save any objects seen in the current frame into Spatial Memory
+        if (res.observedObjects && res.observedObjects.length > 0) {
+          mergeObservedObjects(res.observedObjects, currentHeading);
+        }
+
+        // Also store current frame into recent frames buffer
+        if (frame) {
+          recentFramesRef.current = [
+            { image: frame, timestamp: now, headingDeg: currentHeading },
+            ...recentFramesRef.current,
+          ].slice(0, MAX_PAST_FRAMES);
+        }
 
         const fullAnswer = res.followUpDirection
           ? `${res.spokenAnswer} ${res.followUpDirection}`
           : res.spokenAnswer;
 
+        setIsRecalledFromMemory(Boolean(res.isFromMemory));
         setSpokenResponse(fullAnswer);
         speechManager.speak(fullAnswer, { isUrgent: true });
       } catch (err) {
         console.error('Voice query error:', err);
         const fallbackMsg = 'Could not analyze the video feed right now. Please try again.';
+        setIsRecalledFromMemory(false);
         setSpokenResponse(fallbackMsg);
         speechManager.speak(fallbackMsg, { isUrgent: true });
       } finally {
@@ -74,7 +326,7 @@ export default function App() {
         transcriptRef.current = '';
       }
     },
-    []
+    [mergeObservedObjects]
   );
 
   // Initialize Web Speech Recognition (Safari / Chrome Desktop)
@@ -177,10 +429,19 @@ export default function App() {
     }
   }, [processVoiceQuery]);
 
-  // Toggle Voice Input (Unlocks iOS Safari TTS on tap)
+  // Toggle Voice Input (Unlocks iOS Safari TTS + iOS Compass Orientation on tap)
   const toggleVoiceInput = useCallback(() => {
-    // Unlock iOS Safari audio output inside direct user tap gesture
     speechManager.unlockForIOS();
+
+    // Request iOS 13+ DeviceOrientation permission on first user tap so compass tracking works
+    if (
+      !orientationPermissionRequestedRef.current &&
+      typeof DeviceOrientationEvent !== 'undefined' &&
+      typeof (DeviceOrientationEvent as any).requestPermission === 'function'
+    ) {
+      orientationPermissionRequestedRef.current = true;
+      (DeviceOrientationEvent as any).requestPermission().catch(() => {});
+    }
 
     if (isProcessingRef.current) return;
 
@@ -244,6 +505,8 @@ export default function App() {
         isProcessing={isProcessing}
         liveTranscript={transcript}
         spokenResponse={spokenResponse}
+        isRecalledFromMemory={isRecalledFromMemory}
+        rememberedObjectCount={spatialMemory.length}
       />
 
       {/* 2. Single Prominent Button to Activate Voice Input */}
@@ -275,7 +538,7 @@ export default function App() {
           <>
             <Sparkles className="w-9 h-9 sm:w-12 sm:h-12 stroke-[2.5] animate-spin shrink-0" />
             <span className="text-xl sm:text-4xl tracking-tight uppercase">
-              ANALYZING VIDEO...
+              ANALYZING VIDEO & MEMORY...
             </span>
           </>
         ) : (

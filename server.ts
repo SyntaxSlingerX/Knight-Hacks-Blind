@@ -55,8 +55,8 @@ async function startServer() {
   const app = express();
   const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 
-  // JSON body parser with limit for base64 camera frames
-  app.use(express.json({ limit: '25mb' }));
+  // JSON body parser with limit for base64 camera frames + memory snapshots
+  app.use(express.json({ limit: '35mb' }));
 
   // Health check endpoint
   app.get('/api/health', (req, res) => {
@@ -91,6 +91,75 @@ async function startServer() {
   });
 
   /**
+   * Background Spatial Memory Indexing
+   * Endpoint: POST /api/aria/memorize
+   * Extracts notable objects & landmarks from a camera frame as the user pans around
+   */
+  app.post('/api/aria/memorize', async (req, res) => {
+    try {
+      const { image } = req.body;
+      if (!image) {
+        return res.status(400).json({ error: 'Image is required' });
+      }
+
+      const base64Data = image.replace(/^data:image\/\w+;base64,/, '');
+
+      const response = await generateWithFallback({
+        contents: {
+          parts: [
+            {
+              inlineData: {
+                mimeType: 'image/jpeg',
+                data: base64Data,
+              },
+            },
+            {
+              text: `Identify up to 8 notable physical objects, items, furniture, doors, or landmarks visible in this camera frame so we can remember where they are when the blind user turns the camera away.
+For each object, provide:
+- label: specific name (e.g. "blue water bottle", "backpack", "laptop", "wooden chair", "keys", "closed door")
+- position: position in frame (e.g. "on the left", "directly ahead", "on the right", "on the floor")
+- distance: estimated distance (e.g. "3 feet", "6 feet")
+- landmarkContext: nearby anchor object or surface (e.g. "on the white desk next to the monitor", "on the floor beside the door")`,
+            },
+          ],
+        },
+        config: {
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              observedObjects: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    label: { type: Type.STRING },
+                    position: { type: Type.STRING },
+                    distance: { type: Type.STRING },
+                    landmarkContext: { type: Type.STRING },
+                  },
+                  required: ['label', 'position', 'distance', 'landmarkContext'],
+                },
+              },
+            },
+            required: ['observedObjects'],
+          },
+        },
+      });
+
+      const parsed = JSON.parse(response.text || '{"observedObjects":[]}');
+      res.json({
+        success: true,
+        observedObjects: parsed.observedObjects || [],
+        timestamp: Date.now(),
+      });
+    } catch (error: any) {
+      console.error('Error in /api/aria/memorize:', error);
+      res.status(500).json({ error: 'Memory indexing failed' });
+    }
+  });
+
+  /**
    * Real-time Scene Understanding for Navigation
    * Endpoint: POST /api/aria/analyze
    */
@@ -102,7 +171,6 @@ async function startServer() {
         return res.status(400).json({ error: 'Image data is required' });
       }
 
-      // Extract base64 payload
       const base64Data = image.replace(/^data:image\/\w+;base64,/, '');
 
       const imagePart = {
@@ -125,8 +193,8 @@ CRITICAL SAFETY & ASSISTIVE RULES:
    - "clear": Path ahead is open and clear for walking.
    - "informational": Navigational milestone (doorway located, elevator button panel spotted, crosswalk walk sign visible).
 5. REPETITION AVOIDANCE: If previous guidance was '${previousGuidance || 'none'}' and the scene has not significantly changed, keep update minimal or state that the path remains clear.
-6. EXPLICIT UNCERTAINTY: If lighting is dim, glare is high, or camera view is obscured, explicitly note uncertainty. This prototype does not replace a white cane or guide dog.
-7. NO INVENTED DESTINATIONS: ${userIntent ? `The user's goal is: "${userIntent}". Guide them toward it.` : 'The user has NOT told you where they are going. Do not choose a destination for them, and never tell them to go to a door, exit, hallway, or outside. Only describe what is around them and whether the path directly ahead is safe.'}`;
+6. EXPLICIT UNCERTAINTY: If lighting is dim, glare is high, or camera view is obscured, explicitly note uncertainty.
+7. NO INVENTED DESTINATIONS: ${userIntent ? `The user's goal is: "${userIntent}". Guide them toward it.` : 'Only describe what is around them and whether the path directly ahead is safe.'}`;
 
       const promptText = `Analyze this camera view from the smart glasses. Identify all navigation hazards, walking path status, doorways, stairs, obstacles, and people. Provide immediate navigation guidance.`;
 
@@ -142,49 +210,40 @@ CRITICAL SAFETY & ASSISTIVE RULES:
             properties: {
               urgency: {
                 type: Type.STRING,
-                description: "Urgency category: 'immediate_hazard', 'caution', 'clear', or 'informational'",
               },
               immediateAlert: {
                 type: Type.STRING,
-                description: "Very short alert for instant earcon/vocal warning if hazard or caution (e.g. 'Stop! Descending stairs 3 steps ahead' or 'Caution, chair on right')",
               },
               spokenGuidance: {
                 type: Type.STRING,
-                description: "Concise spoken instruction for the user (max 15-20 words). E.g. 'Path ahead is clear. A closed door is on your left at 10 feet.'",
               },
               spatialDirection: {
                 type: Type.STRING,
-                description: "Recommended safe path: 'straight', 'slight_left', 'slight_right', 'stop', 'detour_left', 'detour_right'",
               },
               confidenceScore: {
                 type: Type.NUMBER,
-                description: "Confidence from 0.0 to 1.0 in this assessment",
               },
               detectedObjects: {
                 type: Type.ARRAY,
-                description: "List of key detected navigation objects and hazards",
                 items: {
                   type: Type.OBJECT,
                   properties: {
                     label: { type: Type.STRING },
-                    position: { type: Type.STRING, description: "e.g. 'left', 'center', 'right', 'ground', 'overhead'" },
-                    distance: { type: Type.STRING, description: "e.g. 'immediate (< 3ft)', 'near (3-6ft)', 'far (> 10ft)'" },
-                    hazardLevel: { type: Type.STRING, description: "'high', 'medium', 'low', 'none'" },
+                    position: { type: Type.STRING },
+                    distance: { type: Type.STRING },
+                    hazardLevel: { type: Type.STRING },
                   },
                   required: ['label', 'position', 'distance', 'hazardLevel'],
                 },
               },
               soundCue: {
                 type: Type.STRING,
-                description: "Sound earcon to trigger: 'hazard_alarm', 'caution_ping', 'clear_chime', 'none'",
               },
               uncertaintyWarning: {
                 type: Type.STRING,
-                description: "Any uncertainty or disclaimer due to lighting/angle",
               },
               sceneSummary: {
                 type: Type.STRING,
-                description: "One sentence overview of the environment",
               },
             },
             required: [
@@ -216,12 +275,12 @@ CRITICAL SAFETY & ASSISTIVE RULES:
   });
 
   /**
-   * Natural Voice Q&A over current glasses camera view
+   * Natural Voice Q&A with Spatial Object Memory (remembers objects outside current camera view)
    * Endpoint: POST /api/aria/query
    */
   app.post('/api/aria/query', async (req, res) => {
     try {
-      const { image, question, audio, audioMimeType } = req.body;
+      const { image, question, audio, audioMimeType, recentFrames, spatialMemory } = req.body;
 
       if (!question && !audio) {
         return res.status(400).json({ error: 'Question or audio is required' });
@@ -229,8 +288,12 @@ CRITICAL SAFETY & ASSISTIVE RULES:
 
       const promptParts: any[] = [];
 
+      // 1. Attach Current Live Camera View
       if (image) {
         const base64Data = image.replace(/^data:image\/\w+;base64,/, '');
+        promptParts.push({
+          text: '[IMAGE 1: CURRENT LIVE CAMERA VIEW (What the camera is pointing at right now)]',
+        });
         promptParts.push({
           inlineData: {
             mimeType: 'image/jpeg',
@@ -239,6 +302,28 @@ CRITICAL SAFETY & ASSISTIVE RULES:
         });
       }
 
+      // 2. Attach Recent Past Camera Views (from when the camera was pointing elsewhere)
+      if (Array.isArray(recentFrames) && recentFrames.length > 0) {
+        recentFrames.slice(0, 3).forEach((pastFrame: any, idx: number) => {
+          if (!pastFrame?.image) return;
+          const cleanPast = pastFrame.image.replace(/^data:image\/\w+;base64,/, '');
+          const secAgo = pastFrame.secondsAgo ?? '?';
+          const dirHint = pastFrame.relativeDirectionHint
+            ? `, direction from current view: ${pastFrame.relativeDirectionHint}`
+            : '';
+          promptParts.push({
+            text: `[PAST MEMORY IMAGE ${idx + 1}: Captured ${secAgo} seconds ago when camera pointed elsewhere${dirHint}]`,
+          });
+          promptParts.push({
+            inlineData: {
+              mimeType: 'image/jpeg',
+              data: cleanPast,
+            },
+          });
+        });
+      }
+
+      // 3. Attach Spoken Voice Audio if recorded via MediaRecorder
       if (audio) {
         const cleanAudio = audio.replace(/^data:audio\/[^;]+;base64,/, '');
         promptParts.push({
@@ -249,21 +334,43 @@ CRITICAL SAFETY & ASSISTIVE RULES:
         });
       }
 
+      // 4. Format Spatial Object Memory Catalog
+      const memoryText =
+        Array.isArray(spatialMemory) && spatialMemory.length > 0
+          ? `\nSPATIAL MEMORY OF OBJECTS SEEN EARLIER (Outside current camera view):\n` +
+            spatialMemory
+              .map(
+                (m: any) =>
+                  `- "${m.label}": seen ${m.secondsAgo}s ago (${m.position}, ~${m.distance}) near [${m.landmarkContext}]${
+                    m.relativeDirectionHint ? ` -> Relative to current heading: ${m.relativeDirectionHint}` : ''
+                  }`
+              )
+              .join('\n')
+          : '\nSPATIAL MEMORY: No prior objects recorded yet.';
+
       promptParts.push({
-        text: audio
-          ? `Listen to the visually impaired user's spoken question in the attached audio (or if silent/unclear, assume they asked: "${question || 'What is in front of me and is the path safe?'}").
-Answer directly, concisely, and spatially based on the camera view.
-Be specific with locations (e.g. "on your right around 5 feet away", "directly in front of you").
-Keep answer under 30 words so it can be spoken quickly.`
-          : `The visually impaired user is asking: "${question}".
-Answer directly, concisely, and spatially based on the camera view.
-Be specific with locations (e.g. "on your right around 5 feet away", "directly in front of you").
-If the object is not visible, say so clearly and suggest where to turn.
-Do not guess. Prioritize safety. Keep answer under 30 words so it can be spoken quickly.`,
+        text: `${
+          audio
+            ? `Listen to the visually impaired user's spoken question in the attached audio (or if silent/unclear, assume they asked: "${
+                question || 'What is in front of me and is the path safe?'
+              }").`
+            : `The visually impaired user is asking: "${question}".`
+        }
+${memoryText}
+
+INSTRUCTIONS FOR ANSWERING WITH SPATIAL MEMORY:
+1. First, check [IMAGE 1: CURRENT LIVE CAMERA VIEW]. If the object/answer is visible right now, describe its current location and distance clearly, and set isFromMemory = false.
+2. If the requested object is NOT in the current live camera view, check the [PAST MEMORY IMAGES] and the [SPATIAL MEMORY OF OBJECTS SEEN EARLIER]!
+   - If found in memory or a past frame, tell the user clearly:
+     a) That it is currently out of frame,
+     b) Where it was remembered (which landmark/surface it was on or near, how long ago, and which direction to turn or pan the camera back based on the past view / compass hint),
+     c) Set isFromMemory = true and isObjectFound = true!
+3. Also list up to 6 notable objects visible in [IMAGE 1: CURRENT LIVE CAMERA VIEW] inside observedObjects so we can add them to spatial memory.
+Keep spokenAnswer natural, spatial, and under 35 words.`,
       });
 
-      const systemInstruction = `You are ARIA VISION, answering questions for a blind user wearing smart glasses.
-Always speak clearly, spatially, and concisely. Keep answers suitable for text-to-speech voice output.`;
+      const systemInstruction = `You are ARIA VISION, an AI visual assistant with Spatial Object Memory for a blind or visually impaired user.
+You remember objects the camera saw earlier even after the camera turns away. Always give clear, concise, spatial directions suitable for text-to-speech.`;
 
       const response = await generateWithFallback({
         contents: {
@@ -277,22 +384,39 @@ Always speak clearly, spatially, and concisely. Keep answers suitable for text-t
             properties: {
               spokenAnswer: {
                 type: Type.STRING,
-                description: "Direct, spoken answer to the user's question (max 30 words)",
+                description: "Direct spoken answer to the user's question (max 35 words)",
               },
               followUpDirection: {
                 type: Type.STRING,
-                description: "Actionable orientation instruction, e.g. 'Turn 45 degrees to the left' or 'Step forward carefully'",
+                description: "Actionable instruction, e.g. 'Turn left back toward the white desk' or 'Step forward carefully'",
               },
               isObjectFound: {
                 type: Type.BOOLEAN,
-                description: "Whether the requested object or landmark was found in the image",
+                description: "True if the object was found either in the current view OR in spatial memory / past frames",
+              },
+              isFromMemory: {
+                type: Type.BOOLEAN,
+                description: "True if the answer or object location was recalled from Spatial Memory / past frames outside the current camera view",
               },
               safetyNote: {
                 type: Type.STRING,
-                description: "Important safety warning regarding the query (e.g. 'Check floor with cane')",
+              },
+              observedObjects: {
+                type: Type.ARRAY,
+                description: "Notable objects currently visible in IMAGE 1 (the current live camera frame) to store in spatial memory",
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    label: { type: Type.STRING },
+                    position: { type: Type.STRING },
+                    distance: { type: Type.STRING },
+                    landmarkContext: { type: Type.STRING },
+                  },
+                  required: ['label', 'position', 'distance', 'landmarkContext'],
+                },
               },
             },
-            required: ['spokenAnswer', 'isObjectFound'],
+            required: ['spokenAnswer', 'isObjectFound', 'isFromMemory', 'observedObjects'],
           },
         },
       });

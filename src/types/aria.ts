@@ -17,6 +17,21 @@ export interface DetectedObject {
   hazardLevel: 'high' | 'medium' | 'low' | 'none';
 }
 
+export interface RememberedObject {
+  label: string;
+  position: string;
+  distance: string;
+  landmarkContext: string;
+  headingDeg?: number | null;
+  timestamp: number;
+}
+
+export interface MemoryFrameSnapshot {
+  image: string;
+  timestamp: number;
+  headingDeg?: number | null;
+}
+
 export interface NavigationAnalysis {
   urgency: UrgencyLevel;
   immediateAlert?: string;
@@ -34,13 +49,20 @@ export interface VoiceQueryResponse {
   spokenAnswer: string;
   followUpDirection?: string;
   isObjectFound: boolean;
+  isFromMemory?: boolean;
   safetyNote?: string;
+  observedObjects?: {
+    label: string;
+    position: string;
+    distance: string;
+    landmarkContext: string;
+  }[];
 }
 
 export type CameraSourceType = 'webcam' | 'aria_stream' | 'simulation';
 
 export interface AriaConnectionConfig {
-  streamUrl: string; // e.g. ws://192.168.1.100:7000 or http://192.168.1.100:8080/stream
+  streamUrl: string;
   connected: boolean;
   deviceModel: string;
   fps: number;
@@ -52,9 +74,9 @@ export type ThemeMode = 'standard-dark' | 'ultra-contrast-yellow' | 'high-contra
 export type TextSize = 'normal' | 'large' | 'xlarge';
 
 export interface UserVoiceSettings {
-  rate: number; // 0.8 to 2.0
-  pitch: number; // 0.8 to 1.3
-  volume: number; // 0 to 1
+  rate: number;
+  pitch: number;
+  volume: number;
   voiceURI?: string;
   soundEffectsEnabled: boolean;
 }

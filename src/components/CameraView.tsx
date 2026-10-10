@@ -1,5 +1,5 @@
 import React, { useRef, useEffect, useState, useCallback } from 'react';
-import { Camera, Glasses, Eye, Volume2, Sparkles, RefreshCw } from 'lucide-react';
+import { Camera, Glasses, Eye, Volume2, Sparkles, RefreshCw, Brain } from 'lucide-react';
 import { CameraSourceType, AriaConnectionConfig } from '../types/aria';
 import { SIMULATION_SCENARIOS, drawAriaGlassesHUD } from '../utils/ariaSimulations';
 
@@ -13,6 +13,8 @@ interface CameraViewProps {
   isProcessing?: boolean;
   liveTranscript?: string;
   spokenResponse?: string;
+  isRecalledFromMemory?: boolean;
+  rememberedObjectCount?: number;
 }
 
 export const CameraView: React.FC<CameraViewProps> = ({
@@ -25,6 +27,8 @@ export const CameraView: React.FC<CameraViewProps> = ({
   isProcessing = false,
   liveTranscript = '',
   spokenResponse = '',
+  isRecalledFromMemory = false,
+  rememberedObjectCount = 0,
 }) => {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -263,7 +267,16 @@ export const CameraView: React.FC<CameraViewProps> = ({
       {/* Hidden canvas for webcam frame capture */}
       {sourceType !== 'aria_stream' && <canvas ref={canvasRef} className="hidden" />}
 
-      {/* Minimal Corner Pill to switch video source or flip iPhone camera */}
+      {/* Top-Left Spatial Memory Status Indicator */}
+      <div
+        aria-live="polite"
+        className="absolute top-3 left-3 z-10 flex items-center gap-2 bg-black/85 backdrop-blur-md px-3.5 py-2 rounded-2xl border border-amber-400/60 text-xs font-black text-amber-300"
+      >
+        <Brain className="w-4 h-4 text-amber-400 shrink-0" />
+        <span>Memory: {rememberedObjectCount} objects</span>
+      </div>
+
+      {/* Minimal Top-Right Pill to switch video source or flip iPhone camera */}
       <div className="absolute top-3 right-3 z-10 flex items-center gap-1.5 bg-black/80 backdrop-blur-md p-1.5 rounded-2xl border border-slate-700">
         <button
           onClick={() => onSourceChange('webcam')}
@@ -325,16 +338,24 @@ export const CameraView: React.FC<CameraViewProps> = ({
           {!isListening && isProcessing && (
             <div className="flex items-center gap-3 text-lg sm:text-2xl font-black text-amber-300">
               <Sparkles className="w-6 h-6 sm:w-7 sm:h-7 animate-spin shrink-0" />
-              <span>Analyzing video...</span>
+              <span>Analyzing video & spatial memory...</span>
             </div>
           )}
 
           {!isListening && !isProcessing && spokenResponse && (
-            <div className="flex items-start gap-3">
-              <Volume2 className="w-6 h-6 sm:w-7 sm:h-7 text-amber-400 shrink-0 mt-1" />
-              <p className="text-lg sm:text-3xl font-black text-white leading-snug">
-                "{spokenResponse}"
-              </p>
+            <div className="flex flex-col gap-1.5">
+              {isRecalledFromMemory && (
+                <span className="inline-flex items-center gap-1.5 self-start px-2.5 py-0.5 rounded-lg bg-amber-400 text-black text-xs font-black uppercase tracking-wider">
+                  <Brain className="w-3.5 h-3.5" />
+                  Recalled from Spatial Memory
+                </span>
+              )}
+              <div className="flex items-start gap-3">
+                <Volume2 className="w-6 h-6 sm:w-7 sm:h-7 text-amber-400 shrink-0 mt-1" />
+                <p className="text-lg sm:text-3xl font-black text-white leading-snug">
+                  "{spokenResponse}"
+                </p>
+              </div>
             </div>
           )}
         </div>
