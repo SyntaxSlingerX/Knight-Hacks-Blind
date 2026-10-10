@@ -12,7 +12,7 @@ import {
 } from 'lucide-react';
 import { soundEffects } from '../utils/audio';
 import { speechManager } from '../utils/speech';
-import { askNavigationQuestion } from '../utils/geminiClient';
+import { askNavigationQuestion, AriaApiError } from '../utils/geminiClient';
 import { VoiceQueryResponse } from '../types/aria';
 
 export const QUICK_VOICE_QUESTIONS = [
@@ -193,7 +193,10 @@ export const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
         transcriptRef.current = '';
       } catch (err: any) {
         console.error('Error querying voice:', err);
-        const errMsg = 'Sorry, I could not analyze the camera view right now. Please try again.';
+        const errMsg =
+          err instanceof AriaApiError && err.status === 429
+            ? 'The AI has reached its usage limit, so I cannot answer right now.'
+            : 'Sorry, I could not analyze the camera view right now. Please try again.';
         speechManager.speak(errMsg, { interrupt: true, onEnd: () => setBusy(false) });
       } finally {
         isProcessingRef.current = false;

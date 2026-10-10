@@ -33,7 +33,10 @@ import { AriaSetupModal } from './components/AriaSetupModal';
 import { SafetyDisclaimer } from './components/SafetyDisclaimer';
 import { soundEffects } from './utils/audio';
 import { speechManager } from './utils/speech';
-import { analyzeNavigationFrame } from './utils/geminiClient';
+import { analyzeNavigationFrame, AriaApiError } from './utils/geminiClient';
+
+const QUOTA_MESSAGE =
+  'The AI has reached its usage limit, so assistance is paused. Please use a white cane or guide dog.';
 
 // Pause between the end of one scan and the start of the next
 const SCAN_INTERVAL_MS = 3000;
@@ -138,6 +141,9 @@ export default function App() {
     setLastSpokenText(text);
   }, []);
 
+  const isAssistanceActiveRef = useRef<boolean>(isAssistanceActive);
+  isAssistanceActiveRef.current = isAssistanceActive;
+
   // Perform single vision frame scan
   const performScan = useCallback(async (requestedManually: boolean = false) => {
     if (!captureFrameRef.current) return;
@@ -226,7 +232,14 @@ export default function App() {
       }
     } catch (err: any) {
       console.error('Scan error:', err);
-      if (isManual && !isMutedRef.current) {
+      if (err instanceof AriaApiError && err.status === 429) {
+        // Out of AI requests: stop scanning instead of failing every few seconds
+        if (isAssistanceActiveRef.current) {
+          isAssistanceActiveRef.current = false;
+          setIsAssistanceActive(false);
+        }
+        speechManager.speak(QUOTA_MESSAGE, { interrupt: true });
+      } else if (isManual && !isMutedRef.current) {
         speechManager.speak('Scan failed. Check your connection and try again.', { interrupt: true });
       }
     } finally {
@@ -263,8 +276,6 @@ export default function App() {
   }, []);
 
   // Toggle Assistance
-  const isAssistanceActiveRef = useRef<boolean>(isAssistanceActive);
-  isAssistanceActiveRef.current = isAssistanceActive;
 
   const toggleAssistance = useCallback(() => {
     const nextState = !isAssistanceActiveRef.current;

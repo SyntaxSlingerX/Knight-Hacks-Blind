@@ -1,5 +1,20 @@
 import { NavigationAnalysis, VoiceQueryResponse } from '../types/aria';
 
+/** Error from the Aria server, keeping the HTTP status (429 = Gemini usage limit reached). */
+export class AriaApiError extends Error {
+  constructor(message: string, public status: number) {
+    super(message);
+  }
+}
+
+async function throwApiError(response: Response): Promise<never> {
+  const errorData = await response.json().catch(() => ({}));
+  throw new AriaApiError(
+    errorData.details || errorData.error || `Server returned ${response.status}`,
+    response.status
+  );
+}
+
 export async function analyzeNavigationFrame(
   base64Image: string,
   previousGuidance?: string,
@@ -16,8 +31,7 @@ export async function analyzeNavigationFrame(
   });
 
   if (!response.ok) {
-    const errorData = await response.json().catch(() => ({}));
-    throw new Error(errorData.details || errorData.error || `Server returned ${response.status}`);
+    await throwApiError(response);
   }
 
   const result = await response.json();
@@ -41,8 +55,7 @@ export async function askNavigationQuestion(
   });
 
   if (!response.ok) {
-    const errorData = await response.json().catch(() => ({}));
-    throw new Error(errorData.details || errorData.error || `Server returned ${response.status}`);
+    await throwApiError(response);
   }
 
   const result = await response.json();

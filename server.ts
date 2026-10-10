@@ -7,6 +7,23 @@ import { GoogleGenAI, Type, ThinkingLevel } from '@google/genai';
 
 dotenv.config();
 
+// Override with GEMINI_MODEL in .env to try another model (e.g. one with a bigger free quota)
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
+
+/** Reply with a clear error; quota and bad-key errors get their real status so the page can react. */
+function sendGeminiError(res: express.Response, route: string, label: string, error: any) {
+  const status = error?.status === 429 || error?.status === 400 || error?.status === 403 ? error.status : 500;
+  if (status === 429) {
+    console.error(`${route}: Gemini usage limit reached for ${GEMINI_MODEL}. Wait for it to reset, or use another key/model.`);
+  } else {
+    console.error(`Error in ${route}:`, error);
+  }
+  res.status(status).json({
+    error: status === 429 ? 'quota_exceeded' : label,
+    details: error?.message || String(error),
+  });
+}
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
@@ -101,7 +118,7 @@ CRITICAL SAFETY & ASSISTIVE RULES:
 
       const startedAt = Date.now();
       const response = await ai.models.generateContent({
-        model: 'gemini-3.8-flash',
+        model: GEMINI_MODEL,
         contents: {
           parts: [imagePart, { text: promptText }],
         },
@@ -109,7 +126,7 @@ CRITICAL SAFETY & ASSISTIVE RULES:
           systemInstruction,
           responseMimeType: 'application/json',
           thinkingConfig: {
-            thinkingLevel: ThinkingLevel.MINIMAL, // A late hazard warning is useless; keep scans fast
+            thinkingLevel: ThinkingLevel.LOW, // Lowest level gemini-3.8-flash supports; keeps scans fast
           },
           responseSchema: {
             type: Type.OBJECT,
@@ -186,11 +203,7 @@ CRITICAL SAFETY & ASSISTIVE RULES:
         timestamp: Date.now(),
       });
     } catch (error: any) {
-      console.error('Error in /api/aria/analyze:', error);
-      res.status(500).json({
-        error: 'Vision analysis failed',
-        details: error?.message || String(error),
-      });
+      sendGeminiError(res, '/api/aria/analyze', 'Vision analysis failed', error);
     }
   });
 
@@ -231,7 +244,7 @@ Always speak clearly, spatially, and concisely. Keep answers suitable for text-t
 
       const startedAt = Date.now();
       const response = await ai.models.generateContent({
-        model: 'gemini-3.8-flash',
+        model: GEMINI_MODEL,
         contents: {
           parts: promptParts,
         },
@@ -239,7 +252,7 @@ Always speak clearly, spatially, and concisely. Keep answers suitable for text-t
           systemInstruction,
           responseMimeType: 'application/json',
           thinkingConfig: {
-            thinkingLevel: ThinkingLevel.MINIMAL, // Voice answers must feel instant
+            thinkingLevel: ThinkingLevel.LOW, // Lowest level gemini-3.8-flash supports
           },
           responseSchema: {
             type: Type.OBJECT,
@@ -279,11 +292,7 @@ Always speak clearly, spatially, and concisely. Keep answers suitable for text-t
         timestamp: Date.now(),
       });
     } catch (error: any) {
-      console.error('Error in /api/aria/query:', error);
-      res.status(500).json({
-        error: 'Voice query failed',
-        details: error?.message || String(error),
-      });
+      sendGeminiError(res, '/api/aria/query', 'Voice query failed', error);
     }
   });
 
