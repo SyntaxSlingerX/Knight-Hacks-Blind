@@ -8,21 +8,79 @@ import { VoiceQueryResponse } from '../types/aria';
 interface VoiceAssistantProps {
   getFrame: () => string | null;
   onAnswerReceived?: (answer: string) => void;
+  /** True from the moment the mic opens until the spoken answer finishes. */
+  onBusyChange?: (busy: boolean) => void;
 }
+
+// If an answer's speech never reports finishing, release the busy state anyway
+const BUSY_SAFETY_MS = 30000;
 
 export const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
   getFrame,
   onAnswerReceived,
+  onBusyChange,
 }) => {
   const [isListening, setIsListening] = useState<boolean>(false);
-  const [transcript, setTranscript] = useState<string>('');
   const [inputText, setInputText] = useState<string>('');
   const [isProcessing, setIsProcessing] = useState<boolean>(false);
   const [lastResponse, setLastResponse] = useState<VoiceQueryResponse | null>(null);
   const [speechSupported, setSpeechSupported] = useState<boolean>(true);
   const recognitionRef = useRef<any>(null);
+  const transcriptRef = useRef<string>('');
+  const isProcessingRef = useRef<boolean>(false);
+  const busyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Initialize Web Speech Recognition
+  // Keep latest props/handlers in refs so the recognition callbacks (created once) never go stale
+  const getFrameRef = useRef(getFrame);
+  const onAnswerReceivedRef = useRef(onAnswerReceived);
+  const onBusyChangeRef = useRef(onBusyChange);
+  getFrameRef.current = getFrame;
+  onAnswerReceivedRef.current = onAnswerReceived;
+  onBusyChangeRef.current = onBusyChange;
+
+  const setBusy = (busy: boolean) => {
+    if (busyTimerRef.current) {
+      clearTimeout(busyTimerRef.current);
+      busyTimerRef.current = null;
+    }
+    if (busy) {
+      busyTimerRef.current = setTimeout(() => onBusyChangeRef.current?.(false), BUSY_SAFETY_MS);
+    }
+    onBusyChangeRef.current?.(busy);
+  };
+
+  const handleSendQuestion = async (question: string) => {
+    if (!question.trim() || isProcessingRef.current) return;
+
+    isProcessingRef.current = true;
+    setIsProcessing(true);
+    setBusy(true);
+    try {
+      const frame = getFrameRef.current();
+      const res = await askNavigationQuestion(frame, question);
+      setLastResponse(res);
+
+      // Speak the answer right away, cutting off any navigation chatter
+      const textToSpeak = [res.spokenAnswer, res.followUpDirection].filter(Boolean).join(' ');
+      speechManager.speak(textToSpeak, { interrupt: true, onEnd: () => setBusy(false) });
+      onAnswerReceivedRef.current?.(textToSpeak);
+
+      setInputText('');
+    } catch (err: any) {
+      console.error('Error querying voice:', err);
+      speechManager.speak('Sorry, I could not analyze the scene right now. Please try again.', {
+        interrupt: true,
+        onEnd: () => setBusy(false),
+      });
+    } finally {
+      isProcessingRef.current = false;
+      setIsProcessing(false);
+    }
+  };
+  const handleSendQuestionRef = useRef(handleSendQuestion);
+  handleSendQuestionRef.current = handleSendQuestion;
+
+  // Initialize Web Speech Recognition once
   useEffect(() => {
     if (typeof window === 'undefined') return;
 
@@ -46,79 +104,70 @@ export const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
 
     recognition.onresult = (event: any) => {
       let current = '';
-      for (let i = event.resultIndex; i < event.results.length; i++) {
+      for (let i = 0; i < event.results.length; i++) {
         current += event.results[i][0].transcript;
       }
-      setTranscript(current);
+      transcriptRef.current = current;
       setInputText(current);
     };
 
     recognition.onerror = (event: any) => {
-      console.warn('Speech recognition error:', event.error);
-      setIsListening(false);
-      soundEffects.playMicEnded();
+      if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
+        speechManager.speak('Microphone access is blocked. Allow the microphone in your browser settings.', {
+          interrupt: true,
+        });
+      } else if (event.error !== 'no-speech' && event.error !== 'aborted') {
+        console.warn('Speech recognition error:', event.error);
+      }
     };
 
     recognition.onend = () => {
       setIsListening(false);
       soundEffects.playMicEnded();
-      // If transcript was captured, trigger the query
-      if (transcript.trim().length > 2) {
-        handleSendQuestion(transcript.trim());
+      const heard = transcriptRef.current.trim();
+      transcriptRef.current = '';
+      if (heard.length > 2) {
+        handleSendQuestionRef.current(heard);
+      } else {
+        speechManager.speak("I didn't catch that. Tap the button and try again.", {
+          interrupt: true,
+          onEnd: () => setBusy(false),
+        });
       }
     };
 
     recognitionRef.current = recognition;
 
     return () => {
-      if (recognitionRef.current) {
-        try {
-          recognitionRef.current.abort();
-        } catch (_) {}
-      }
+      recognition.onend = null;
+      try {
+        recognition.abort();
+      } catch (_) {}
+      if (busyTimerRef.current) clearTimeout(busyTimerRef.current);
     };
-  }, [transcript]);
+  }, []);
 
   const toggleListening = () => {
     if (!speechSupported) {
-      alert('Speech recognition is not supported in this browser. Please use text input below.');
+      speechManager.speak('Voice questions are not supported in this browser. Try Chrome or Safari, or type your question.', {
+        interrupt: true,
+      });
       return;
     }
 
     if (isListening) {
       recognitionRef.current?.stop();
     } else {
-      setTranscript('');
+      // Silence the assistant so the mic doesn't hear it talking
+      speechManager.stop();
+      setBusy(true);
+      transcriptRef.current = '';
       try {
         recognitionRef.current?.start();
       } catch (err) {
         console.warn('Could not start speech recognition:', err);
+        setBusy(false);
       }
-    }
-  };
-
-  const handleSendQuestion = async (question: string) => {
-    if (!question.trim() || isProcessing) return;
-
-    setIsProcessing(true);
-    try {
-      const frame = getFrame();
-      const res = await askNavigationQuestion(frame, question);
-      setLastResponse(res);
-
-      // Speak answer aloud immediately!
-      const textToSpeak = `${res.spokenAnswer} ${res.followUpDirection || ''}`;
-      speechManager.speak(textToSpeak, { isUrgent: false });
-      onAnswerReceived?.(textToSpeak);
-
-      setInputText('');
-      setTranscript('');
-    } catch (err: any) {
-      console.error('Error querying voice:', err);
-      const errMsg = 'Sorry, I could not analyze the scene right now. Please try again.';
-      speechManager.speak(errMsg);
-    } finally {
-      setIsProcessing(false);
     }
   };
 
@@ -237,7 +286,8 @@ export const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
             <button
               onClick={() =>
                 speechManager.speak(
-                  `${lastResponse.spokenAnswer} ${lastResponse.followUpDirection || ''}`
+                  [lastResponse.spokenAnswer, lastResponse.followUpDirection].filter(Boolean).join(' '),
+                  { interrupt: true }
                 )
               }
               className="text-xs text-slate-300 hover:text-white underline"

@@ -39,13 +39,17 @@ import { soundEffects } from './utils/audio';
 import { speechManager } from './utils/speech';
 import { analyzeNavigationFrame } from './utils/geminiClient';
 
+// Pause between the end of one scan and the start of the next
+const SCAN_INTERVAL_MS = 3000;
+// Re-announce unchanged-but-reworded guidance at most this often
+const REPEAT_GUIDANCE_MS = 12000;
+
 export default function App() {
   // Navigation & Assistance State
   const [isAssistanceActive, setIsAssistanceActive] = useState<boolean>(false);
   const [isScanning, setIsScanning] = useState<boolean>(false);
   const [currentAnalysis, setCurrentAnalysis] = useState<NavigationAnalysis | null>(null);
   const [analysisHistory, setAnalysisHistory] = useState<NavigationAnalysis[]>([]);
-  const [lastSpokenText, setLastSpokenText] = useState<string>('');
 
   // Camera & Aria Config
   const [cameraSource, setCameraSource] = useState<CameraSourceType>('simulation');
@@ -90,100 +94,144 @@ export default function App() {
     }
   };
 
+  // Latest values for the scan loop, kept in refs so the loop isn't restarted on every change
+  const lastSpokenTextRef = useRef<string>('');
+  const lastSpokenAtRef = useRef<number>(0);
+  const lastUrgencyRef = useRef<string>('');
+  const lastDirectionRef = useRef<string>('');
+  const scanInFlightRef = useRef<boolean>(false);
+  const voiceBusyRef = useRef<boolean>(false);
+  const isMutedRef = useRef<boolean>(isMuted);
+  const soundEffectsEnabledRef = useRef<boolean>(voiceSettings.soundEffectsEnabled);
+  isMutedRef.current = isMuted;
+  soundEffectsEnabledRef.current = voiceSettings.soundEffectsEnabled;
+
   // Perform single vision frame scan
-  const performScan = useCallback(
-    async (isManual: boolean = false) => {
-      if (!captureFrameRef.current) return;
-      const frame = captureFrameRef.current();
-      if (!frame) return;
+  const performScan = useCallback(async (isManual: boolean = false) => {
+    if (!captureFrameRef.current || scanInFlightRef.current) return;
+    const frame = captureFrameRef.current();
+    if (!frame) return;
 
-      setIsScanning(true);
-      try {
-        const result = await analyzeNavigationFrame(frame, lastSpokenText);
-        setCurrentAnalysis(result);
-        setAnalysisHistory((prev) => [result, ...prev.slice(0, 19)]);
+    scanInFlightRef.current = true;
+    setIsScanning(true);
+    try {
+      const result = await analyzeNavigationFrame(frame, lastSpokenTextRef.current);
+      setCurrentAnalysis(result);
+      setAnalysisHistory((prev) => [result, ...prev.slice(0, 19)]);
 
-        const isHazard = result.urgency === 'immediate_hazard';
-        const isCaution = result.urgency === 'caution';
+      const isHazard = result.urgency === 'immediate_hazard';
+      const urgencyChanged = result.urgency !== lastUrgencyRef.current;
+      const directionChanged = result.spatialDirection !== lastDirectionRef.current;
+      lastUrgencyRef.current = result.urgency;
+      lastDirectionRef.current = result.spatialDirection;
 
-        // Earcon trigger based on analysis
-        if (!isMuted && voiceSettings.soundEffectsEnabled) {
-          if (isHazard) {
-            soundEffects.playHazardAlarm();
-          } else if (isCaution) {
-            soundEffects.playCautionPing();
-          } else if (result.urgency === 'clear') {
-            soundEffects.playClearChime();
-          }
+      // While the user is asking a question, only hazards may interrupt them
+      if (voiceBusyRef.current && !isHazard && !isManual) return;
+
+      const muted = isMutedRef.current;
+
+      // Earcons only when something changes (or on hazards), not on every scan
+      if (!muted && soundEffectsEnabledRef.current && (isHazard || urgencyChanged || isManual)) {
+        if (isHazard) {
+          soundEffects.playHazardAlarm();
+        } else if (result.urgency === 'caution') {
+          soundEffects.playCautionPing();
+        } else if (result.urgency === 'clear') {
+          soundEffects.playClearChime();
         }
+      }
 
-        // Spoken Navigation Output
-        const textToSpeak = result.immediateAlert
-          ? `${result.immediateAlert}. ${result.spokenGuidance}`
-          : result.spokenGuidance;
+      const textToSpeak = result.immediateAlert
+        ? `${result.immediateAlert}. ${result.spokenGuidance}`
+        : result.spokenGuidance;
 
-        // Repetition check: only speak if different or if manual or if hazard
-        if (textToSpeak !== lastSpokenText || isManual || isHazard) {
-          setLastSpokenText(textToSpeak);
-          if (!isMuted) {
-            speechManager.speak(textToSpeak, { isUrgent: isHazard });
-          }
+      // Don't narrate every scan: speak on hazards, manual scans, real changes,
+      // or as an occasional refresh when the wording has changed
+      const isStale = Date.now() - lastSpokenAtRef.current > REPEAT_GUIDANCE_MS;
+      const shouldSpeak =
+        isManual ||
+        isHazard ||
+        urgencyChanged ||
+        directionChanged ||
+        (isStale && textToSpeak !== lastSpokenTextRef.current);
+
+      if (shouldSpeak) {
+        lastSpokenTextRef.current = textToSpeak;
+        lastSpokenAtRef.current = Date.now();
+        if (!muted && !(voiceBusyRef.current && isHazard && !isManual)) {
+          speechManager.speak(textToSpeak, { isUrgent: isHazard, interrupt: isManual });
         }
-      } catch (err: any) {
-        console.error('Scan error:', err);
-      } finally {
-        setIsScanning(false);
       }
-    },
-    [lastSpokenText, isMuted, voiceSettings.soundEffectsEnabled]
-  );
-
-  // Assistance Loop: scans every 3.8s when active
-  useEffect(() => {
-    if (!isAssistanceActive) {
-      if (scanTimerRef.current) {
-        clearInterval(scanTimerRef.current);
-        scanTimerRef.current = null;
+    } catch (err: any) {
+      console.error('Scan error:', err);
+      if (isManual && !isMutedRef.current) {
+        speechManager.speak('Scan failed. Check your connection and try again.', { interrupt: true });
       }
-      return;
+    } finally {
+      scanInFlightRef.current = false;
+      setIsScanning(false);
     }
+  }, []);
 
-    // Trigger initial scan immediately
-    performScan();
+  // Assistance Loop: scan, wait, scan again (never overlapping requests)
+  useEffect(() => {
+    if (!isAssistanceActive) return;
 
-    scanTimerRef.current = setInterval(() => {
-      performScan();
-    }, 3800);
+    let cancelled = false;
+    const loop = async () => {
+      await performScan();
+      if (!cancelled) {
+        scanTimerRef.current = setTimeout(loop, SCAN_INTERVAL_MS);
+      }
+    };
+    loop();
 
     return () => {
+      cancelled = true;
       if (scanTimerRef.current) {
-        clearInterval(scanTimerRef.current);
+        clearTimeout(scanTimerRef.current);
         scanTimerRef.current = null;
       }
     };
   }, [isAssistanceActive, performScan]);
 
+  const handleVoiceBusyChange = useCallback((busy: boolean) => {
+    voiceBusyRef.current = busy;
+  }, []);
+
   // Toggle Assistance
-  const toggleAssistance = () => {
-    const nextState = !isAssistanceActive;
+  const isAssistanceActiveRef = useRef<boolean>(isAssistanceActive);
+  isAssistanceActiveRef.current = isAssistanceActive;
+
+  const toggleAssistance = useCallback(() => {
+    const nextState = !isAssistanceActiveRef.current;
+    isAssistanceActiveRef.current = nextState;
     setIsAssistanceActive(nextState);
+    lastUrgencyRef.current = '';
+    lastDirectionRef.current = '';
 
     if (nextState) {
       soundEffects.playSystemStatusToggle(true);
-      speechManager.speak('Navigation assistance active. Scanning surroundings.', { isUrgent: true });
+      speechManager.speak('Navigation assistance active. Scanning surroundings.', { interrupt: true });
     } else {
       soundEffects.playSystemStatusToggle(false);
-      speechManager.stop();
-      speechManager.speak('Navigation assistance paused.');
+      speechManager.speak('Navigation assistance paused.', { interrupt: true });
     }
-  };
+  }, []);
 
   // Keyboard Accessibility Shortcuts
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      // Don't trigger if user is typing in an input
-      if (['INPUT', 'TEXTAREA'].includes((e.target as HTMLElement).tagName)) {
-        return;
+      const target = e.target as HTMLElement;
+      // Don't hijack typing, or Enter/Space on a focused button or link
+      if (
+        e.metaKey ||
+        e.ctrlKey ||
+        e.altKey ||
+        target.isContentEditable ||
+        ['INPUT', 'TEXTAREA', 'SELECT', 'BUTTON', 'A'].includes(target.tagName)
+      ) {
+        if (e.code !== 'Escape') return;
       }
 
       if (e.code === 'KeyS') {
@@ -198,7 +246,6 @@ export default function App() {
           prev === 'standard-dark' ? 'ultra-contrast-yellow' : 'standard-dark'
         );
       } else if (e.code === 'Escape') {
-        e.preventDefault();
         speechManager.stop();
       }
     };
@@ -322,7 +369,7 @@ export default function App() {
                 onClick={() =>
                   speechManager.speak(
                     currentAnalysis.immediateAlert || currentAnalysis.spokenGuidance,
-                    { isUrgent: true }
+                    { interrupt: true }
                   )
                 }
                 aria-label="Replay current navigation instruction"
@@ -353,7 +400,8 @@ export default function App() {
             <div id="voice-qa">
               <VoiceAssistant
                 getFrame={() => (captureFrameRef.current ? captureFrameRef.current() : null)}
-                onAnswerReceived={(ans) => setLastSpokenText(ans)}
+                onAnswerReceived={(ans) => (lastSpokenTextRef.current = ans)}
+                onBusyChange={handleVoiceBusyChange}
               />
             </div>
           </div>
