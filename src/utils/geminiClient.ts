@@ -1,4 +1,4 @@
-import { NavigationAnalysis, VoiceQueryResponse } from '../types/aria';
+import { EarlyNavigationAnalysis, NavigationAnalysis, VoiceQueryResponse } from '../types/aria';
 
 export interface FormattedPastFrame {
   image: string;
@@ -15,9 +15,36 @@ export interface FormattedMemoryItem {
   relativeDirectionHint?: string;
 }
 
+export interface ConversationTurn {
+  role: 'user' | 'assistant';
+  text: string;
+}
+
+/** The vision service has hit its usage limit and will refuse requests for a while. */
+export class QuotaExceededError extends Error {
+  constructor(public retryAfterMs: number) {
+    super('Vision service usage limit reached');
+  }
+}
+
+async function throwForResponse(response: Response): Promise<never> {
+  const errorData = await response.json().catch(() => ({}));
+  if (response.status === 429 || errorData.error === 'quota_exceeded') {
+    throw new QuotaExceededError(Number(errorData.retryAfterMs) || 60000);
+  }
+  throw new Error(errorData.details || errorData.error || `Server returned ${response.status}`);
+}
+
+/**
+ * Hazard scan of one camera frame. The server answers in two lines: the spoken part as soon as
+ * Gemini has written it (passed to onEarly), then the complete result (returned).
+ */
 export async function analyzeNavigationFrame(
   base64Image: string,
-  previousGuidance?: string
+  previousGuidance?: string,
+  /** The place the user asked to be guided to, if any. */
+  userIntent?: string,
+  onEarly?: (early: EarlyNavigationAnalysis) => void
 ): Promise<NavigationAnalysis> {
   const response = await fetch('/api/aria/analyze', {
     method: 'POST',
@@ -25,19 +52,42 @@ export async function analyzeNavigationFrame(
     body: JSON.stringify({
       image: base64Image,
       previousGuidance,
+      userIntent,
     }),
   });
 
-  if (!response.ok) {
-    const errorData = await response.json().catch(() => ({}));
-    throw new Error(errorData.details || errorData.error || `Server returned ${response.status}`);
-  }
+  if (!response.ok) await throwForResponse(response);
+  if (!response.body) throw new Error('The vision service sent an empty answer');
 
-  const result = await response.json();
-  return {
-    ...result.data,
-    timestamp: result.timestamp || Date.now(),
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffered = '';
+  let final: NavigationAnalysis | null = null;
+
+  const handleLine = (line: string) => {
+    if (!line.trim()) return;
+    const message = JSON.parse(line);
+    if (message.type === 'early' && message.data?.urgency) {
+      onEarly?.(message.data);
+    } else if (message.type === 'final') {
+      final = { ...message.data, timestamp: message.timestamp || Date.now() };
+    } else if (message.type === 'error') {
+      throw new Error(message.details || 'Vision analysis failed');
+    }
   };
+
+  while (true) {
+    const { done, value } = await reader.read();
+    buffered += decoder.decode(value, { stream: !done });
+    const lines = buffered.split('\n');
+    buffered = lines.pop() || '';
+    lines.forEach(handleLine);
+    if (done) break;
+  }
+  handleLine(buffered);
+
+  if (!final) throw new Error('The vision service answer was cut off');
+  return final;
 }
 
 export async function memorizeFrameObjects(
@@ -63,7 +113,10 @@ export async function askNavigationQuestion(
   audioBase64?: string | null,
   audioMimeType?: string,
   recentFrames?: FormattedPastFrame[],
-  spatialMemory?: FormattedMemoryItem[]
+  spatialMemory?: FormattedMemoryItem[],
+  conversation?: ConversationTurn[],
+  /** True when the camera should be live but no fresh picture is available right now. */
+  cameraUnavailable?: boolean
 ): Promise<VoiceQueryResponse> {
   const response = await fetch('/api/aria/query', {
     method: 'POST',
@@ -75,13 +128,12 @@ export async function askNavigationQuestion(
       audioMimeType: audioMimeType || undefined,
       recentFrames: recentFrames || undefined,
       spatialMemory: spatialMemory || undefined,
+      conversation: conversation || undefined,
+      cameraUnavailable: cameraUnavailable || undefined,
     }),
   });
 
-  if (!response.ok) {
-    const errorData = await response.json().catch(() => ({}));
-    throw new Error(errorData.details || errorData.error || `Server returned ${response.status}`);
-  }
+  if (!response.ok) await throwForResponse(response);
 
   const result = await response.json();
   return result.data;
