@@ -1,14 +1,22 @@
 import React, { useRef, useEffect, useState, useCallback } from 'react';
 import { Camera, Glasses, Eye, Volume2, Sparkles, RefreshCw, Brain } from 'lucide-react';
-import { CameraSourceType, AriaConnectionConfig } from '../types/aria';
+import { CameraSourceType, AriaConnectionConfig, AriaPose } from '../types/aria';
 import { SIMULATION_SCENARIOS, drawAriaGlassesHUD } from '../utils/ariaSimulations';
+import { AriaStreamClient, AriaStreamSnapshot } from '../utils/ariaStream';
+
+// Longest side of the picture sent to Gemini, whatever the camera delivers
+const MAX_CAPTURE_DIM = 800;
 
 interface CameraViewProps {
   sourceType: CameraSourceType;
   onSourceChange: (source: CameraSourceType) => void;
   onFrameCaptureReady: (captureFn: () => string | null) => void;
   ariaConfig: AriaConnectionConfig;
-  onAriaConfigChange: (config: AriaConnectionConfig) => void;
+  onAriaConfigChange: React.Dispatch<React.SetStateAction<AriaConnectionConfig>>;
+  /** Live head pose from the glasses' SLAM, or null when there is none to trust. */
+  onAriaPose?: (pose: AriaPose | null) => void;
+  /** Extra content drawn over the picture (e.g. the SLAM mini-map). */
+  children?: React.ReactNode;
   isListening?: boolean;
   isProcessing?: boolean;
   liveTranscript?: string;
@@ -23,6 +31,8 @@ export const CameraView: React.FC<CameraViewProps> = ({
   onFrameCaptureReady,
   ariaConfig,
   onAriaConfigChange,
+  onAriaPose,
+  children,
   isListening = false,
   isProcessing = false,
   liveTranscript = '',
@@ -33,11 +43,17 @@ export const CameraView: React.FC<CameraViewProps> = ({
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const simCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const ariaWsRef = useRef<WebSocket | null>(null);
+  const scratchCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const ariaStreamRef = useRef<AriaStreamClient | null>(null);
+  const onAriaPoseRef = useRef(onAriaPose);
+  onAriaPoseRef.current = onAriaPose;
 
-  const [facingMode, setFacingMode] = useState<'environment' | 'user'>('environment');
+  const [ariaStream, setAriaStream] = useState<AriaStreamSnapshot | null>(null);
+
+  // Mirrors the picture on screen only. What is sent for analysis stays the right way round,
+  // so "left" and "right" in the spoken guidance are never swapped.
+  const [isMirrored, setIsMirrored] = useState<boolean>(false);
   const [selectedScenarioIndex, setSelectedScenarioIndex] = useState<number>(0);
-  const [ariaLastFrameTime, setAriaLastFrameTime] = useState<number>(0);
 
   // Capture current video frame for Gemini Vision
   const captureCurrentFrame = useCallback((): string | null => {
@@ -47,10 +63,21 @@ export const CameraView: React.FC<CameraViewProps> = ({
     }
 
     if (sourceType === 'aria_stream') {
-      if (canvasRef.current) {
-        return canvasRef.current.toDataURL('image/jpeg', 0.85);
-      }
-      return null;
+      const live = canvasRef.current;
+      // Never hand a frozen picture to the hazard scan: no fresh frame means no view at all
+      if (!live || live.width === 0 || !ariaStreamRef.current?.isFrameFresh()) return null;
+
+      const longest = Math.max(live.width, live.height);
+      if (longest <= MAX_CAPTURE_DIM) return live.toDataURL('image/jpeg', 0.85);
+
+      const scale = MAX_CAPTURE_DIM / longest;
+      const scratch = scratchCanvasRef.current ?? (scratchCanvasRef.current = document.createElement('canvas'));
+      scratch.width = Math.round(live.width * scale);
+      scratch.height = Math.round(live.height * scale);
+      const scratchCtx = scratch.getContext('2d');
+      if (!scratchCtx) return null;
+      scratchCtx.drawImage(live, 0, 0, scratch.width, scratch.height);
+      return scratch.toDataURL('image/jpeg', 0.85);
     }
 
     // Default: Webcam / iPhone Camera
@@ -59,7 +86,7 @@ export const CameraView: React.FC<CameraViewProps> = ({
       const canvas = canvasRef.current;
       if (video.videoWidth === 0 || video.videoHeight === 0) return null;
 
-      const maxDim = 800;
+      const maxDim = MAX_CAPTURE_DIM;
       let w = video.videoWidth;
       let h = video.videoHeight;
       if (w > maxDim || h > maxDim) {
@@ -109,7 +136,7 @@ export const CameraView: React.FC<CameraViewProps> = ({
 
         currentStream = await navigator.mediaDevices.getUserMedia({
           video: {
-            facingMode: { ideal: facingMode },
+            facingMode: { ideal: 'environment' }, // the rear camera on a phone
             width: { ideal: 1280 },
             height: { ideal: 720 },
           },
@@ -135,75 +162,45 @@ export const CameraView: React.FC<CameraViewProps> = ({
         currentStream.getTracks().forEach((t) => t.stop());
       }
     };
-  }, [sourceType, facingMode, onSourceChange]);
+  }, [sourceType, onSourceChange]);
 
-  // Connect to Meta Project Aria WebSocket Stream if selected
+  // Keep a self-healing connection to the glasses bridge while the Aria source is selected
   useEffect(() => {
-    if (sourceType !== 'aria_stream') {
-      if (ariaWsRef.current) {
-        ariaWsRef.current.close();
-        ariaWsRef.current = null;
-      }
-      return;
-    }
+    if (sourceType !== 'aria_stream') return;
 
     const url = ariaConfig.streamUrl.trim();
-    if (!url.startsWith('ws://') && !url.startsWith('wss://')) {
-      return;
-    }
+    if (!url.startsWith('ws://') && !url.startsWith('wss://')) return;
 
-    let ws: WebSocket | null = null;
-
-    try {
-      ws = new WebSocket(url);
-      ariaWsRef.current = ws;
-
-      ws.onopen = () => {
-        onAriaConfigChange({ ...ariaConfig, connected: true });
-      };
-
-      ws.onmessage = (event) => {
-        const now = performance.now();
-        const dt = ariaLastFrameTime ? now - ariaLastFrameTime : 33;
-        setAriaLastFrameTime(now);
-        const currentFps = Math.min(60, Math.round(1000 / Math.max(dt, 16)));
-
-        const img = new Image();
-        img.onload = () => {
-          if (canvasRef.current) {
-            const c = canvasRef.current;
-            c.width = img.width || 1408;
-            c.height = img.height || 1408;
-            const ctx = c.getContext('2d');
-            if (ctx) {
-              ctx.drawImage(img, 0, 0);
-              drawAriaGlassesHUD(ctx, c.width, c.height, `${currentFps} FPS Live`);
-            }
+    const client = new AriaStreamClient(url, () => canvasRef.current, {
+      onChange: (snapshot) => {
+        setAriaStream(snapshot);
+        onAriaConfigChange((prev) => {
+          const latencyMs = snapshot.status ? Math.round(snapshot.status.frameAgeMs) : prev.latencyMs;
+          const batteryLevel = snapshot.status?.battery ?? prev.batteryLevel;
+          if (
+            prev.connected === snapshot.live &&
+            prev.fps === snapshot.fps &&
+            prev.latencyMs === latencyMs &&
+            prev.batteryLevel === batteryLevel
+          ) {
+            return prev;
           }
-        };
-
-        if (typeof event.data === 'string') {
-          img.src = event.data.startsWith('data:image')
-            ? event.data
-            : `data:image/jpeg;base64,${event.data}`;
-        } else if (event.data instanceof Blob) {
-          img.src = URL.createObjectURL(event.data);
-        }
-      };
-
-      ws.onerror = () => {
-        onAriaConfigChange({ ...ariaConfig, connected: false });
-      };
-
-      ws.onclose = () => {
-        onAriaConfigChange({ ...ariaConfig, connected: false });
-      };
-    } catch (_) {}
+          return { ...prev, connected: snapshot.live, fps: snapshot.fps, latencyMs, batteryLevel };
+        });
+      },
+      onPose: (pose) => onAriaPoseRef.current?.(pose),
+    });
+    ariaStreamRef.current = client;
+    client.start();
 
     return () => {
-      if (ws) ws.close();
+      client.stop();
+      ariaStreamRef.current = null;
+      setAriaStream(null);
+      onAriaPoseRef.current?.(null);
+      onAriaConfigChange((prev) => (prev.connected || prev.fps ? { ...prev, connected: false, fps: 0 } : prev));
     };
-  }, [sourceType, ariaConfig.streamUrl]);
+  }, [sourceType, ariaConfig.streamUrl, onAriaConfigChange]);
 
   // Render Simulated Video Feed
   useEffect(() => {
@@ -217,6 +214,21 @@ export const CameraView: React.FC<CameraViewProps> = ({
     scenario.draw(ctx, canvas.width, canvas.height, 0);
     drawAriaGlassesHUD(ctx, canvas.width, canvas.height, scenario.name);
   }, [sourceType, selectedScenarioIndex]);
+
+  const ariaLive = Boolean(ariaStream?.live);
+  const bridgeStatus = ariaStream?.status ?? null;
+  let ariaNotice = { title: 'Waiting for the glasses camera...', hint: '' };
+  if (!ariaStream || ariaStream.socket !== 'open') {
+    ariaNotice = {
+      title: 'Glasses bridge not reachable. Reconnecting...',
+      hint: `Looking for it at ${ariaConfig.streamUrl}`,
+    };
+  } else if (bridgeStatus && bridgeStatus.state !== 'streaming') {
+    ariaNotice = {
+      title: 'Glasses stream lost. Reconnecting...',
+      hint: bridgeStatus.detail || 'Waiting for the glasses to start streaming.',
+    };
+  }
 
   return (
     <div
@@ -235,7 +247,7 @@ export const CameraView: React.FC<CameraViewProps> = ({
           playsInline
           muted
           autoPlay
-          className="w-full h-full object-cover"
+          className={`w-full h-full object-cover ${isMirrored ? '-scale-x-100' : ''}`}
           aria-label="Live video display"
         />
       )}
@@ -244,7 +256,9 @@ export const CameraView: React.FC<CameraViewProps> = ({
       {sourceType === 'aria_stream' && (
         <canvas
           ref={canvasRef}
-          className="w-full h-full object-contain"
+          // The glasses picture is square. Show it widescreen by trimming the top and bottom on screen;
+          // Gemini still receives the full square picture.
+          className={`h-full max-w-full aspect-video object-cover ${isMirrored ? '-scale-x-100' : ''}`}
           aria-label="Aria smart glasses video display"
         />
       )}
@@ -259,7 +273,7 @@ export const CameraView: React.FC<CameraViewProps> = ({
             setSelectedScenarioIndex((prev) => (prev + 1) % SIMULATION_SCENARIOS.length)
           }
           title="Tap video to cycle demo scene"
-          className="w-full h-full object-cover cursor-pointer"
+          className={`w-full h-full object-cover cursor-pointer ${isMirrored ? '-scale-x-100' : ''}`}
           aria-label="Simulated camera video display"
         />
       )}
@@ -267,16 +281,57 @@ export const CameraView: React.FC<CameraViewProps> = ({
       {/* Hidden canvas for webcam frame capture */}
       {sourceType !== 'aria_stream' && <canvas ref={canvasRef} className="hidden" />}
 
-      {/* Top-Left Spatial Memory Status Indicator */}
-      <div
-        aria-live="polite"
-        className="absolute top-3 left-3 z-10 flex items-center gap-2 bg-black/85 backdrop-blur-md px-3.5 py-2 rounded-2xl border border-amber-400/60 text-xs font-black text-amber-300"
-      >
-        <Brain className="w-4 h-4 text-amber-400 shrink-0" />
-        <span>Memory: {rememberedObjectCount} objects</span>
+      {/* The last glasses frame stays on the canvas when the stream drops, so cover it:
+          a frozen picture must never look like a live one */}
+      {sourceType === 'aria_stream' && !ariaLive && (
+        <div
+          role="status"
+          aria-live="polite"
+          className="absolute inset-0 z-[5] flex flex-col items-center justify-center gap-3 bg-black/80 px-6 text-center"
+        >
+          <Glasses className="w-12 h-12 sm:w-16 sm:h-16 text-amber-400 animate-pulse" />
+          <p className="text-xl sm:text-3xl font-black text-white">{ariaNotice.title}</p>
+          {ariaNotice.hint && (
+            <p className="text-sm sm:text-lg font-bold text-amber-300 break-all">{ariaNotice.hint}</p>
+          )}
+        </div>
+      )}
+
+      {children}
+
+      {/* Top-Left Status Indicators */}
+      <div className="absolute top-3 left-3 z-10 flex flex-col items-start gap-1.5">
+        <div
+          aria-live="polite"
+          className="flex items-center gap-2 bg-black/85 backdrop-blur-md px-3.5 py-2 rounded-2xl border border-amber-400/60 text-xs font-black text-amber-300"
+        >
+          <Brain className="w-4 h-4 text-amber-400 shrink-0" />
+          <span>Memory: {rememberedObjectCount} objects</span>
+        </div>
+
+        {/* Glasses link health. Updates every second, so it stays out of the screen reader's way;
+            the overlay above and the spoken alerts carry the same news. */}
+        {sourceType === 'aria_stream' && (
+          <div
+            aria-hidden="true"
+            className={`flex items-center gap-2 bg-black/85 backdrop-blur-md px-3.5 py-2 rounded-2xl border text-xs font-black ${
+              ariaLive ? 'border-emerald-400/60 text-emerald-300' : 'border-red-500/70 text-red-300'
+            }`}
+          >
+            <span
+              className={`w-2 h-2 rounded-full shrink-0 ${ariaLive ? 'bg-emerald-400' : 'bg-red-500 animate-pulse'}`}
+            />
+            <span>
+              {ariaLive ? `Glasses live: ${ariaStream?.fps ?? 0} fps` : 'Glasses offline'}
+              {ariaLive && bridgeStatus?.battery != null ? `, battery ${bridgeStatus.battery}%` : ''}
+              {ariaLive && bridgeStatus && bridgeStatus.slam !== 'off' ? `, SLAM ${bridgeStatus.slam}` : ''}
+              {ariaLive && bridgeStatus?.thermal ? ', running hot' : ''}
+            </span>
+          </div>
+        )}
       </div>
 
-      {/* Minimal Top-Right Pill to switch video source or flip iPhone camera */}
+      {/* Minimal Top-Right Pill to switch video source or mirror the picture */}
       <div className="absolute top-3 right-3 z-10 flex items-center gap-1.5 bg-black/80 backdrop-blur-md p-1.5 rounded-2xl border border-slate-700">
         <button
           onClick={() => onSourceChange('webcam')}
@@ -289,16 +344,15 @@ export const CameraView: React.FC<CameraViewProps> = ({
           <span>Camera</span>
         </button>
 
-        {sourceType === 'webcam' && (
-          <button
-            onClick={() => setFacingMode((prev) => (prev === 'environment' ? 'user' : 'environment'))}
-            aria-label="Flip between rear and front camera"
-            className="px-2.5 py-1.5 rounded-xl text-xs font-black bg-slate-800 text-yellow-300 hover:bg-slate-700 flex items-center gap-1"
-          >
-            <RefreshCw className="w-3.5 h-3.5" />
-            <span>{facingMode === 'environment' ? 'Rear' : 'Front'}</span>
-          </button>
-        )}
+        <button
+          onClick={() => setIsMirrored((prev) => !prev)}
+          aria-label="Mirror the picture"
+          aria-pressed={isMirrored}
+          className="px-2.5 py-1.5 rounded-xl text-xs font-black bg-slate-800 text-yellow-300 hover:bg-slate-700 flex items-center gap-1"
+        >
+          <RefreshCw className="w-3.5 h-3.5" />
+          <span>{isMirrored ? 'Mirrored' : 'Flip'}</span>
+        </button>
 
         <button
           onClick={() => onSourceChange('simulation')}
