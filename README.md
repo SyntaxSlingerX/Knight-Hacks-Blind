@@ -1,4 +1,4 @@
-# AriaVision 👓
+# AriaVision
 
 **An AI-powered assistant that uses Meta Aria glasses to help users understand their surroundings through spoken descriptions and answers.**
 
